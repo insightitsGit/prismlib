@@ -5,7 +5,9 @@
 PrismLib is an open-source tensor-native library with two distinct products sharing one mathematical core:
 
 - **PrismCache** — a semantic LLM response cache. Apps wrap any LLM call; repeated or paraphrased queries return a cached answer without touching the LLM again. Competes with GPTCache, Zep, Momento Semantic Cache, Redis Semantic Cache.
-- **PrismDriver** — a tensor-native database driver. Replaces SQL connection strings in app config; an in-process vector cache (PrismResonance) is kept warm via WAL streaming from a server-side daemon. Sub-millisecond reads with no DB round-trip.
+- **PrismDriver** — a tensor-native database driver split across two nodes:
+  - **Server Wrapper** (`pip install "prismlib[wrapper]"`, runs on the DB node): an OS daemon that intercepts WAL/binlog changes, vectorizes rows via `RowVectorizer`, encrypts them with `TensorCipher` (CHORUS Fabric), and streams encrypted float32 frames to all connected DLL Drivers.
+  - **DLL Driver** (`pip install "prismlib[fabric]"`, runs on the app node): an in-process library that subscribes to the Server Wrapper's CHORUS Fabric stream, decrypts frames, and keeps a local PrismResonance index warm. App queries hit the in-process index — sub-millisecond, no DB round-trip, no SQL.
 
 GitHub: https://github.com/insightitsGit/prismlib
 License: Apache 2.0
@@ -81,7 +83,12 @@ The landing page should be a single HTML file (no build tools, no Node.js) — p
 1. **Hero** — headline, sub-headline, two CTA buttons (GitHub, pip install copy-to-clipboard)
 2. **Problem / cost** — pain point: LLM API cost, DB latency; hook: "91% of your LLM calls are duplicates"
 3. **Two products** — side-by-side cards: PrismCache (LLM cache) vs PrismDriver (DB driver)
-4. **How it works** — data flow diagram or step illustration for each product (PrismCache: query → JL → wave lookup → cache hit/miss; PrismDriver: app → gRPC → PrismResonance → sub-ms result)
+4. **How it works** — data flow diagram or step illustration for each product:
+   - PrismCache: query in → JL projection (tenant-isolated) → wave-interference lookup → HIT (return cached) / MISS (call LLM, store, return)
+   - PrismDriver — must show BOTH nodes clearly:
+     - DB node: Database → WAL/binlog → **Server Wrapper** → RowVectorizer → TensorCipher → CHORUS Fabric stream (gRPC)
+     - App node: **DLL Driver** receives CHORUS frames → PrismResonance local index → app query → sub-ms result
+   - The two-node split is a key differentiator — make it visually prominent, not an afterthought
 5. **Benchmark** — the numbers above in a visual table or stat cards; note the Azure live test context
 6. **Code examples** — tabbed: Python / Go / C# / PHP; show the 5-line integration
 7. **Use cases** — icon cards: SaaS multi-tenant, chatbot cost reduction, DB read acceleration, RAG pipeline caching

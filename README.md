@@ -4,16 +4,17 @@
 
 Two products, one mathematical core:
 
-| Product | What it does | Install |
-|---------|-------------|---------|
-| **PrismCache** | Semantic LLM cache — serve repeated/paraphrased queries from memory instead of paying the LLM again | `pip install prismlib[cache]` |
-| **PrismDriver** | Tensor-native DB driver — replaces SQL connection strings; queries hit an in-process vector cache seeded by WAL streaming | `pip install prismlib[fabric]` |
+| Product | Component | Deployed on | Install |
+|---------|-----------|-------------|---------|
+| **PrismCache** | In-process LLM cache | App node | `pip install "prismlib[cache]"` |
+| **PrismDriver** | **Server Wrapper** (daemon) | **DB node** | `pip install "prismlib[wrapper]"` |
+| **PrismDriver** | **DLL Driver** (in-process) | **App node** | `pip install "prismlib[fabric]"` |
 
-Both use the same core: Johnson-Lindenstrauss tenant isolation + wave-interference similarity + HMAC-signed CHORUS Fabric transport.
+PrismDriver is a two-node system: the **Server Wrapper** runs as an OS daemon on the same machine as your database, intercepts WAL/binlog changes, vectorizes rows, and streams them over CHORUS Fabric to the **DLL Driver** on your app server. The driver keeps a local PrismResonance index warm so reads never leave the process.
 
 Built on two open-source InsightIts libraries:
 - **[PrismResonance](https://github.com/insightitsGit/prismresonance)** — the wave-memory similarity engine powering every cache lookup and local vector index
-- **[CHORUS Fabric](https://github.com/insightitsGit/chorus_fabric)** — the gRPC binary streaming protocol that carries encrypted float32 tensor frames between the DB node and app nodes
+- **[CHORUS Fabric](https://github.com/insightitsGit/chorus_fabric)** — the gRPC binary streaming protocol that carries encrypted float32 tensor frames from the Server Wrapper to the DLL Driver
 
 ---
 
@@ -163,9 +164,43 @@ print(f"Projected monthly: ${metrics.cost_saved_usd * 30:.0f}")
 
 ### PrismDriver
 
-#### Replace your DB connection string
+PrismDriver has two components that work together. Install each on the right machine.
 
-No passwords in app config. The Server Wrapper on the DB node handles auth; the driver speaks CHORUS Fabric over gRPC.
+**On the DB node — Server Wrapper**
+
+The Server Wrapper is an OS daemon that sits next to your database. It reads WAL/binlog changes, vectorizes rows using `RowVectorizer`, encrypts them with `TensorCipher` (via CHORUS Fabric), and streams float32 frames to every connected DLL Driver.
+
+```bash
+# Install on the DB node (Linux or macOS)
+pip install "prismlib[wrapper]"
+
+# Configure and start
+prism-wrapper --config /etc/prism/wrapper.toml
+```
+
+```toml
+# /etc/prism/wrapper.toml
+[database]
+flavor = "postgresql"
+dsn = "postgresql://user:pass@localhost/mydb"
+
+[chorus]
+listen_port = 50051
+tenant_id = "products-service"
+```
+
+Supported databases: PostgreSQL (WAL / wal2json), MySQL (binlog), CockroachDB (EXPERIMENTAL CHANGEFEED), TiDB (push model).
+
+**On the app node — DLL Driver**
+
+The DLL Driver is an in-process library that replaces your DB connection string. On startup it connects to the Server Wrapper, subscribes to the CHORUS Fabric stream, and keeps a local PrismResonance index warm. All reads hit the in-process index — no network round-trip, sub-millisecond latency.
+
+```bash
+# Install on the app node
+pip install "prismlib[fabric]"
+```
+
+#### Replace your DB connection string
 
 ```python
 # Before
@@ -249,24 +284,33 @@ $results = $driver->query($embedding, topK: 5, threshold: 0.85);
 ## Architecture
 
 ```
-┌─ DB Node ──────────────────────────────────────────┐
-│  PostgreSQL / MySQL / CockroachDB / TiDB           │
-│       │ WAL / binlog / changefeed                  │
-│  ┌────▼─────────────────────────┐                  │
-│  │  prism-wrapper (OS daemon)   │                  │
-│  │  vectorizes rows → CHORUS    │                  │
-│  └────────────┬─────────────────┘                  │
-└───────────────┼────────────────────────────────────┘
-                │ gRPC float32 stream (port 50051)
-┌─ App Node ────┼────────────────────────────────────┐
-│  ┌────────────▼─────────────────────────────────┐  │
-│  │  Your Application                            │  │
-│  │  ┌─────────────┐  ┌──────────────────────┐   │  │
-│  │  │ PrismCache  │  │ PrismDriver (DLL)    │   │  │
-│  │  │ LLM cache   │  │ local PrismResonance │   │  │
-│  │  └─────────────┘  └──────────────────────┘   │  │
-│  └──────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────┘
+┌─ DB Node ──────────────────────────────────────────────────────┐
+│  PostgreSQL / MySQL / CockroachDB / TiDB                       │
+│       │ WAL / binlog / changefeed                              │
+│  ┌────▼────────────────────────────────────────────────────┐   │
+│  │  prism-wrapper  (pip install "prismlib[wrapper]")       │   │
+│  │  RowVectorizer → TensorCipher (V_enc = V @ K)          │   │
+│  │  → HMAC-SHA256 watermark → CHORUSPublisher             │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+└───────────────────────────┼────────────────────────────────────┘
+                            │  CHORUS Fabric  (gRPC, port 50051)
+                            │  encrypted float32 frames
+┌─ App Node ────────────────┼────────────────────────────────────┐
+│  ┌────────────────────────▼───────────────────────────────┐    │
+│  │  PrismDriver DLL  (pip install "prismlib[fabric]")     │    │
+│  │  Subscribe loop → decrypt → PrismResonance index       │    │
+│  └──────────────────────────────────────────┬─────────────┘    │
+│                                             │ sub-ms query     │
+│  ┌──────────────────────────────────────────▼─────────────┐    │
+│  │  Your Application                                       │    │
+│  │  ┌──────────────────┐   ┌───────────────────────────┐  │    │
+│  │  │  PrismCache      │   │  PrismDriver              │  │    │
+│  │  │  LLM cache       │   │  local PrismResonance     │  │    │
+│  │  │  pip install     │   │  (no DB round-trip)       │  │    │
+│  │  │  prismlib[cache] │   │                           │  │    │
+│  │  └──────────────────┘   └───────────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ---
