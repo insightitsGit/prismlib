@@ -748,6 +748,72 @@ The gRPC binary streaming protocol for machine-to-machine tensor communication. 
 
 ---
 
+## 12. CHORUS Fabric — Why the 98.6% Works
+
+The 98.6% latency reduction in the PrismDriver benchmark is not a caching coincidence. It is the direct result of CHORUS Fabric doing proactive data placement.
+
+### What CHORUS Fabric is
+
+CHORUS Fabric is a binary gRPC streaming protocol originally built for the InsightIts CHORUS M2M system — a 4-container topology for tensor communication between AI agents. The same properties that make it ideal for agent-to-agent tensor sharing (binary framing, persistent push streams, HMAC integrity, zero JSON overhead) make it ideal for database WAL streaming.
+
+### How it produces the 98.6%
+
+The benchmark ran in two phases:
+
+**Phase 1 — Baseline (no CHORUS, no driver):** Every read query left the app node, crossed the Azure inter-container network to the DB node, executed a similarity search there, and returned the result. Average: **142.8ms**. This is unavoidable as long as data lives only on the DB node.
+
+**Phase 2 — CHORUS Fabric active:** Before Phase 2 started, the subscription loop had already streamed 11,000 rows from the DB node at **26,000 rows/s** via CHORUS Fabric. Each WAL event was:
+
+```
+DB node:
+  Row event → RowVectorizer → 64-d float32 vector
+  → TensorCipher (V_enc = V @ K) → HMAC-SHA256 watermark
+  → CHORUS Fabric frame → gRPC server-streaming
+
+App node (background asyncio task, running since connect()):
+  ← receive frame → decrypt → verify HMAC
+  → PrismResonance.ingest(row_id, text_repr, vector)
+```
+
+By the time the first Phase 2 query arrived, the entire dataset was in RAM on the app node. Every query hit a local cosine search over a float32 matrix. Average: **2.0ms** — bounded by RAM bandwidth and matrix math, not network RTT.
+
+### Why CHORUS Fabric specifically
+
+A naive HTTP polling approach would check for new rows every N seconds — introducing lag proportional to the poll interval. A REST webhook approach would add JSON serialization overhead and require the DB node to track subscriber state. CHORUS Fabric solves both:
+
+- **Server-streaming gRPC** — the DB node pushes frames as they arrive; zero poll lag
+- **Binary float32 framing** — no JSON encoding/decoding; a 64-d vector is 256 bytes on the wire
+- **Persistent connection** — one TCP connection per subscriber, reconnect with exponential backoff built in
+- **TensorCipher + HMAC** — data is encrypted and authenticated in the float32 domain without format conversion
+
+The 26,000 rows/s warmup throughput reflects these properties: with JSON serialization, the same 64-d vector would be ~1,800 bytes (7× larger) and would require string parsing on receive.
+
+### Connection to the CHORUS M2M system
+
+CHORUS Fabric was designed so AI agents in the CHORUS Protocol could share tensor state — model activation vectors, attention maps, float32 weight deltas — without REST overhead between containers. PrismLib is the first production application of CHORUS Fabric outside the agent coordination context. The fact that the same protocol works for database WAL streaming is not an accident: both use cases share the same pattern — a producer of float32 arrays that need to reach a consumer proactively, with integrity guarantees and minimal serialization overhead.
+
+---
+
+## 13. Enterprise
+
+PrismLib is Apache 2.0 and free to use for any purpose. Enterprise agreements are available for teams that need:
+
+| Need | Enterprise offering |
+|------|-------------------|
+| Guaranteed uptime | SLA-backed support, dedicated incident escalation |
+| Regulated industries | SOC 2 documentation, audit logging, GDPR data lineage, tenant isolation attestation |
+| Air-gapped deployments | On-premises install support, hardened Docker images, no-internet builds |
+| Higher hit rates | Custom embedding model integration (legal, medical, finance, code domains) |
+| Multi-region scale | Active-active DB node clusters, cross-region WAL fan-out, geo-aware driver routing |
+| Migration | Architecture review, migration from Redis/GPTCache, custom RowVectorizer schemas |
+
+No public pricing page — every deployment is different.
+
+**Contact: insightits.info@gmail.com**
+**GitHub: github.com/insightitsGit/prismlib**
+
+---
+
 ## Appendix: Running the Benchmark Yourself
 
 ```bash
