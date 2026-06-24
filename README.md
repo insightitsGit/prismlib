@@ -11,6 +11,10 @@ Two products, one mathematical core:
 
 Both use the same core: Johnson-Lindenstrauss tenant isolation + wave-interference similarity + HMAC-signed CHORUS Fabric transport.
 
+Built on two open-source InsightIts libraries:
+- **[PrismResonance](https://github.com/insightitsGit/prismresonance)** — the wave-memory similarity engine powering every cache lookup and local vector index
+- **[CHORUS Fabric](https://github.com/insightitsGit/chorus_fabric)** — the gRPC binary streaming protocol that carries encrypted float32 tensor frames between the DB node and app nodes
+
 ---
 
 ## Installation
@@ -291,6 +295,68 @@ python benchmark/load/run_benchmark.py --scenario smoke --no-azure
 ```
 
 See [`benchmark/`](benchmark/) for full results, Locust CSV files, and the Azure deploy script.
+
+---
+
+## Core libraries
+
+PrismLib is built on two InsightIts open-source libraries. You can use them directly if you need lower-level access.
+
+### PrismResonance
+
+> **[github.com/insightitsGit/prismresonance](https://github.com/insightitsGit/prismresonance)** · `pip install prismresonance`
+
+The wave-memory similarity engine. Every cache lookup and local vector index in PrismLib goes through PrismResonance.
+
+How it works:
+- Receives a float32 embedding vector
+- Johnson-Lindenstrauss reduces it to 64 dimensions using a projection matrix seeded by `SHA-256(tenant_id)` — this is what gives each tenant mathematically isolated address space
+- Computes similarity as wave interference (cosine in projected space) in three lock-free phases: snapshot → ONNX MatMul → rank
+- Returns ranked candidates in sub-millisecond time entirely in-process
+
+PrismCache wraps this for LLM response caching. PrismDriver's local replica is a PrismResonance index kept warm by WAL streaming.
+
+```python
+from prismresonance import PrismProjector, WaveIndex
+
+projector = PrismProjector(dim=64, tenant_id="my-tenant")
+index = WaveIndex(projector)
+
+index.add(vector=my_embedding, payload={"row_id": "product-1", "text": "Widget"})
+results = index.query(vector=query_embedding, top_k=5, threshold=0.85)
+```
+
+### CHORUS Fabric
+
+> **[github.com/insightitsGit/chorus_fabric](https://github.com/insightitsGit/chorus_fabric)** · `pip install chorus-fabric`
+
+The secure gRPC binary streaming protocol for machine-to-machine tensor communication. PrismDriver uses CHORUS Fabric as its transport layer between the server wrapper on the DB node and the DLL driver on the app node.
+
+How it works:
+- `prism-wrapper` (DB node) vectorizes WAL row events via `RowVectorizer`, encrypts them with `TensorCipher` (`V_enc = V @ K`), appends an HMAC-SHA256 watermark, and publishes batches of raw float32 frames
+- `PrismDriver` (app node) opens a persistent `WrapperService.Subscribe()` gRPC stream, receives encrypted frames, decrypts, and feeds them into the local PrismResonance index
+- Transport is pure binary float32 over gRPC server-streaming — no JSON serialization, no REST overhead
+- The `WrapperService` proto also exposes `Query`, `Write`, `Health`, and `Hello` RPCs for direct interaction
+
+```python
+from chorus_fabric import CHORUSPublisher, DriverEndpoint
+
+publisher = CHORUSPublisher(config)
+publisher.add_driver(DriverEndpoint(host="10.0.1.50", port=50051, tenant_id="prod"))
+await publisher.run(event_queue)  # streams WAL events to all connected drivers
+```
+
+CHORUS Fabric is the same protocol used in the CHORUS M2M system (4-container gRPC topology for tensor communication between AI agents).
+
+---
+
+## Publishing to PyPI
+
+```bash
+pip install build twine
+python -m build
+python -m twine upload dist/* --username __token__ --password pypi-YOUR_TOKEN
+```
 
 ---
 

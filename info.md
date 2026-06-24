@@ -43,6 +43,27 @@ Note: these numbers use a mock LLM (80ms sleep). With a real GPT-4o call (1–3s
 
 ---
 
+## Core libraries (must be credited on the landing page)
+
+PrismLib is built on two open-source InsightIts libraries. The landing page should have a dedicated "Built on" or "Powered by" section crediting both with links, a one-line description, and a brief explanation of how each is used inside PrismLib.
+
+### PrismResonance
+- GitHub: https://github.com/insightitsGit/prismresonance
+- PyPI: `pip install prismresonance`
+- What it is: A dynamic wave-memory layer for vector similarity search. Runs entirely in-process, no external vector DB required.
+- How PrismLib uses it: Every cache hit/miss decision in PrismCache runs through PrismResonance. PrismDriver keeps a local PrismResonance index per tenant, seeded by WAL streaming. The JL projection (64-d, seeded by `SHA-256(tenant_id)`) is a PrismResonance primitive that provides the mathematical cross-tenant isolation guarantee.
+- Suggested landing page copy: *"PrismResonance — the wave-memory engine inside every lookup. Sub-millisecond similarity search, fully in-process, no Pinecone or Qdrant required."*
+
+### CHORUS Fabric
+- GitHub: https://github.com/insightitsGit/chorus_fabric
+- PyPI: `pip install chorus-fabric`
+- What it is: A gRPC binary streaming protocol for machine-to-machine tensor communication. Designed for high-throughput float32 frame transport between AI agents and services.
+- How PrismLib uses it: PrismDriver's entire transport layer is CHORUS Fabric. The `prism-wrapper` daemon on the DB node publishes encrypted WAL row vectors as CHORUS frames; PrismDriver on the app node subscribes and feeds them into the local PrismResonance index. Encryption: `TensorCipher` (`V_enc = V @ K`) + HMAC-SHA256 watermark per frame.
+- Suggested landing page copy: *"CHORUS Fabric — encrypted binary tensor streaming over gRPC. The same protocol powering AI agent mesh networks, now carrying your database changes to the edge."*
+- Note: CHORUS Fabric is also used in the CHORUS Protocol M2M system (InsightIts' AI agent communication layer). Mention this connection — it signals the technology has production use cases beyond PrismLib.
+
+---
+
 ## Core math (for technical readers)
 
 1. **JL Projection**: query embedding → Johnson-Lindenstrauss reduction to 64-d using a random matrix seeded by SHA-256(tenant_id). Mathematically guarantees cross-tenant isolation without any filter clause.
