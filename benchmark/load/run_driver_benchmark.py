@@ -65,17 +65,47 @@ def reset_driver(app_url: str) -> None:
 
 
 def warmup_driver(app_url: str, rows: int) -> dict:
-    console.print(f"[cyan]Warming local index with {rows:,} rows from DB node ...[/cyan]")
+    """Wait for the subscription loop to fill the local index (no explicit warmup call needed)."""
+    console.print(f"[cyan]Waiting for subscription loop to fill local index ({rows:,}+ rows) ...[/cyan]")
     t0 = time.monotonic()
-    r = httpx.post(f"{app_url}/driver/warmup", params={"count": rows}, timeout=180)
-    r.raise_for_status()
-    elapsed = time.monotonic() - t0
-    data = r.json()
-    console.print(
-        f"[green]✓ Warmed: {data['rows_loaded']:,} rows in {elapsed:.1f}s "
-        f"({data['throughput_rows_per_s']:.0f} rows/s, index_size={data['index_size']})[/green]"
-    )
-    return data
+    deadline = t0 + 120
+    last_rows = 0
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(f"{app_url}/driver/status", timeout=5)
+            r.raise_for_status()
+            status = r.json()
+            received = status.get("rows_received", 0)
+            is_warm  = status.get("is_warm", False)
+            if received != last_rows:
+                console.print(f"  rows_received={received} ...")
+                last_rows = received
+            if is_warm and received >= min(rows, 500):
+                elapsed = time.monotonic() - t0
+                throughput = received / elapsed if elapsed > 0 else 0
+                console.print(
+                    f"[green]✓ Index warm: {received:,} rows in {elapsed:.1f}s "
+                    f"({throughput:.0f} rows/s)[/green]"
+                )
+                return {
+                    "rows_loaded": received,
+                    "index_size": status.get("index_size", received),
+                    "elapsed_ms": elapsed * 1000,
+                    "throughput_rows_per_s": throughput,
+                }
+        except Exception:
+            pass
+        time.sleep(3)
+    console.print("[yellow]Warmup timeout — proceeding with available rows[/yellow]")
+    status = httpx.get(f"{app_url}/driver/status", timeout=5).json()
+    received = status.get("rows_received", 0)
+    elapsed  = time.monotonic() - t0
+    return {
+        "rows_loaded": received,
+        "index_size": status.get("index_size", received),
+        "elapsed_ms": elapsed * 1000,
+        "throughput_rows_per_s": received / elapsed if elapsed > 0 else 0,
+    }
 
 
 def run_locust_phase(
@@ -141,11 +171,11 @@ def print_report(
 
     bm = baseline_metrics.get("baseline", {})
     dm = driver_metrics.get("driver", {})
-    speedup = driver_metrics.get("speedup_factor", 0)
 
-    b_avg = bm.get("avg_latency_ms", 0)
-    d_avg = dm.get("avg_latency_ms", 0)
-    pct   = ((b_avg - d_avg) / b_avg * 100) if b_avg > 0 else 0
+    b_avg   = bm.get("avg_latency_ms", 0)
+    d_avg   = dm.get("avg_latency_ms", 0)
+    speedup = (b_avg / d_avg) if d_avg > 0 else 0.0
+    pct     = ((b_avg - d_avg) / b_avg * 100) if b_avg > 0 else 0
 
     t.add_row(
         "Queries",

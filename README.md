@@ -317,6 +317,8 @@ $results = $driver->query($embedding, topK: 5, threshold: 0.85);
 
 ## Benchmark
 
+### PrismCache — semantic LLM cache
+
 Live results from Azure Container App (`westus2`, 1 vCPU / 2 GiB, mock LLM baseline):
 
 | Scenario | Users | Duration | Hit rate | Queries | Tokens saved | Monthly est. |
@@ -326,19 +328,31 @@ Live results from Azure Container App (`westus2`, 1 vCPU / 2 GiB, mock LLM basel
 
 > Numbers use a mock LLM (80ms sleep). With real GPT-4o calls (1–3s), latency speedup is 4–13×; token savings are identical.
 
-Run your own:
+### PrismDriver — two-node baseline vs local index
+
+Live two-node benchmark (Azure Container Apps `westus2`, 30 users × 60s per phase):
+
+| Phase | Path | Avg latency | Queries |
+|-------|------|-------------|---------|
+| **Baseline** (no driver) | App → DB node, network | **142.8 ms** | 3,864 |
+| **Driver** (local index) | App → in-process PrismResonance | **2.0 ms** | 1,479 |
+
+**70.7× faster · 98.6% latency reduction** · Index warmed from 11,000 rows at 26,000 rows/s via CHORUS Fabric subscription loop.
 
 ```bash
-# Against the live Azure endpoint
+# Two-node benchmark (requires both container apps running)
+python benchmark/load/run_driver_benchmark.py \
+  --app-url https://prism-benchmark.nicestone-720c6a9b.westus2.azurecontainerapps.io \
+  --db-url  https://prism-wrapper-sim.nicestone-720c6a9b.westus2.azurecontainerapps.io \
+  --users 30 --duration 60
+
+# PrismCache load test
 python benchmark/load/run_benchmark.py \
   --host https://prism-benchmark.nicestone-720c6a9b.westus2.azurecontainerapps.io \
   --scenario mixed
-
-# Local smoke test (no Azure)
-python benchmark/load/run_benchmark.py --scenario smoke --no-azure
 ```
 
-See [`benchmark/`](benchmark/) for full results, Locust CSV files, and the Azure deploy script.
+See [`benchmark/`](benchmark/) for full results JSON, Locust CSV files, and the Azure deploy script.
 
 ---
 

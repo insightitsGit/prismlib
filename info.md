@@ -43,6 +43,15 @@ Run against live Azure Container App (`westus2`, 1 vCPU / 2 GiB):
 
 Note: these numbers use a mock LLM (80ms sleep). With a real GPT-4o call (1–3s), speedup factor on latency is 4–13×; token cost savings are identical.
 
+### PrismDriver two-node benchmark (Azure, 30 users × 60s per phase)
+
+| Phase | Path | Avg latency |
+|-------|------|-------------|
+| Baseline (no driver installed) | App node → DB node over network | **142.8 ms** |
+| Driver (installed on app node) | App → local PrismResonance index | **2.0 ms** |
+
+**Result: 70.7× faster, 98.6% latency reduction.** Local index warmed with 11,000 rows at 26,000 rows/s via the CHORUS Fabric subscription loop. After warmup there are zero network hops for reads.
+
 ---
 
 ## Core libraries (must be credited on the landing page)
