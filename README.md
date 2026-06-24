@@ -269,19 +269,28 @@ $results = $driver->query($embedding, topK: 5, threshold: 0.85);
 
 ## Benchmark
 
-See [`benchmark/`](benchmark/) — Azure-based load test that measures:
-- Cache hit rate over time
-- P50 / P95 / P99 latency (hit vs miss)
-- Throughput ceiling (req/s)
-- Cost savings per hour at scale
+Live results from Azure Container App (`westus2`, 1 vCPU / 2 GiB, mock LLM baseline):
+
+| Scenario | Users | Duration | Hit rate | Queries | Tokens saved | Monthly est. |
+|----------|-------|----------|----------|---------|-------------|-------------|
+| Light    | 20    | 60s      | **91.0%** | 5,936  | 1,374,464   | **$594**    |
+| Mixed    | 50    | 300s     | **95.9%** | 6,973  | 1,673,216   | **$723**    |
+
+> Numbers use a mock LLM (80ms sleep). With real GPT-4o calls (1–3s), latency speedup is 4–13×; token savings are identical.
+
+Run your own:
 
 ```bash
+# Against the live Azure endpoint
 python benchmark/load/run_benchmark.py \
   --host https://prism-benchmark.nicestone-720c6a9b.westus2.azurecontainerapps.io \
-  --scenario mixed --duration 300
+  --scenario mixed
+
+# Local smoke test (no Azure)
+python benchmark/load/run_benchmark.py --scenario smoke --no-azure
 ```
 
-**Typical results:** 60-80% hit rate · 40-50× latency reduction on hits · $500-$2,000/month saved per 1M queries.
+See [`benchmark/`](benchmark/) for full results, Locust CSV files, and the Azure deploy script.
 
 ---
 
