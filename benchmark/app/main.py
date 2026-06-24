@@ -44,110 +44,18 @@ WRAPPER_URL = os.getenv("PRISM_WRAPPER_URL", "")
 TARGET_DIM  = int(os.getenv("PRISM_TARGET_DIM", "64"))
 TENANT_ID_D = os.getenv("PRISM_TENANT_ID", "benchmark-app")
 
-
-class _LocalIndex:
-    """
-    In-process float32 similarity index.
-    Warmed by pulling WAL events from the Server Wrapper (wrapper-sim).
-    Represents the local PrismResonance index inside PrismDriver.
-    """
-
-    def __init__(self, tenant_id: str, dim: int = 64) -> None:
-        self._tenant_id = tenant_id
-        self._dim = dim
-        self._rows: list[dict] = []
-        self._matrix: Optional[np.ndarray] = None
-        self._dirty = True
-        self._warmed_at: Optional[float] = None
-        self._rows_received = 0
-        self._query_count = 0
-        self._total_latency_ms = 0.0
-
-    def ingest(self, row_id: str, text_repr: str, vector: list[float]) -> None:
-        """Feed one WAL event into the local index."""
-        self._rows.append({
-            "row_id": row_id,
-            "text_repr": text_repr,
-            "vector": np.array(vector, dtype=np.float32),
-        })
-        self._dirty = True
-        self._rows_received += 1
-
-    def _rebuild(self) -> None:
-        if not self._rows:
-            self._matrix = None
-            return
-        self._matrix = np.stack([r["vector"] for r in self._rows])
-        self._dirty = False
-
-    def query(self, query_vector: list[float], top_k: int = 5,
-              threshold: float = 0.5) -> tuple[list[dict], float]:
-        """Sub-millisecond in-process similarity search."""
-        t0 = time.perf_counter()
-        if self._dirty:
-            self._rebuild()
-        if self._matrix is None or len(self._rows) == 0:
-            return [], 0.0
-
-        q = np.array(query_vector, dtype=np.float32)
-        q_norm = np.linalg.norm(q)
-        if q_norm == 0:
-            return [], 0.0
-        q = q / q_norm
-
-        norms = np.linalg.norm(self._matrix, axis=1, keepdims=True) + 1e-8
-        scores = (self._matrix / norms) @ q
-        top_idx = np.argsort(-scores)[:top_k]
-
-        results = []
-        for idx in top_idx:
-            score = float(scores[idx])
-            if score < threshold:
-                break
-            results.append({
-                "row_id":    self._rows[idx]["row_id"],
-                "text_repr": self._rows[idx]["text_repr"],
-                "score":     score,
-            })
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        self._query_count += 1
-        self._total_latency_ms += elapsed_ms
-        return results, elapsed_ms
-
-    def reset(self) -> int:
-        n = len(self._rows)
-        self._rows.clear()
-        self._matrix = None
-        self._dirty = True
-        self._warmed_at = None
-        self._rows_received = 0
-        self._query_count = 0
-        self._total_latency_ms = 0.0
-        return n
-
-    @property
-    def size(self) -> int:
-        return len(self._rows)
-
-    @property
-    def avg_latency_ms(self) -> float:
-        if self._query_count == 0:
-            return 0.0
-        return self._total_latency_ms / self._query_count
-
-
-_local_index: _LocalIndex = _LocalIndex(TENANT_ID_D, TARGET_DIM)
-
-# Stats for driver benchmark
-_driver_stats = {
-    "baseline_queries": 0,
-    "baseline_total_ms": 0.0,
-    "driver_queries": 0,
-    "driver_total_ms": 0.0,
-    "warmup_rows": 0,
-    "warmup_duration_ms": 0.0,
+# Stats for baseline (network) path — driver path stats live on PrismDriver.local_index
+_baseline_stats = {
+    "queries": 0,
+    "total_ms": 0.0,
 }
+
+# PrismDriver singleton — created in lifespan if WRAPPER_URL is set
+_driver: Optional["Any"] = None
+
+
+def get_driver():
+    return _driver
 
 # ---------------------------------------------------------------------------
 # Cache singleton
@@ -193,13 +101,13 @@ def make_llm_fn(question: str, cfg: Any):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cache
+    global _cache, _driver
     cfg = get_config()
     setup_telemetry(cfg.appinsights_connection_string)
 
     try:
         from sentence_transformers import SentenceTransformer  # noqa: F401
-        embedder = None  # let PrismCache.build() pick SentenceTransformerEmbedder
+        embedder = None
     except ImportError:
         embedder = HashEmbedder(output_dim=384)
         logger.warning("sentence-transformers not installed — using HashEmbedder")
@@ -212,9 +120,32 @@ async def lifespan(app: FastAPI):
         embedder=embedder,
     )
     logger.info("PrismCache ready (tenant=%s, mock=%s)", cfg.tenant_id, cfg.use_mock_llm)
+
+    # Start PrismDriver if a wrapper URL is configured.
+    # The subscription loop begins immediately — by the time the first /driver/query
+    # arrives, the local index will already be warm with WAL rows from the DB node.
+    if WRAPPER_URL:
+        from prism.ffi.bindings import PrismDriver, DriverConfig
+        host = WRAPPER_URL.rstrip("/").split("//")[-1].split(":")[0]
+        _driver = PrismDriver(DriverConfig(
+            wrapper_host=host,
+            wrapper_port=int(os.getenv("PRISM_WRAPPER_PORT", "8001")),
+            tenant_id=TENANT_ID_D,
+        ))
+        await _driver.connect()
+        logger.info(
+            "PrismDriver started — subscription loop running, streaming from %s",
+            WRAPPER_URL,
+        )
+    else:
+        logger.info("PRISM_WRAPPER_URL not set — PrismDriver disabled")
+
     yield
+
     _cache.invalidate_all()
-    logger.info("PrismCache shut down.")
+    if _driver is not None:
+        await _driver.close()
+    logger.info("Shutdown complete.")
 
 
 app = FastAPI(
@@ -371,117 +302,100 @@ async def status():
 #  driver   = every query hits the local in-process index)
 # ---------------------------------------------------------------------------
 
-def _make_query_vector(text: str) -> list[float]:
+def _make_query_vector(text: str) -> np.ndarray:
     """Deterministic float32 query vector from text (mirrors wrapper_sim projection)."""
     h = hashlib.sha256(text.encode()).digest()
     seed = int.from_bytes(h[:4], "big")
     rng = np.random.default_rng(seed)
     v = rng.standard_normal(TARGET_DIM).astype(np.float32)
     norm = np.linalg.norm(v)
-    return (v / norm if norm > 0 else v).tolist()
+    return v / norm if norm > 0 else v
 
 
-@app.post("/driver/warmup")
-async def driver_warmup(count: int = Query(default=5000, ge=1, le=100000)):
-    """
-    Pull WAL events from the Server Wrapper and load them into the local index.
-    This is what the background Subscribe() loop does in PrismDriver.
-    Call once before running the 'with-driver' benchmark phase.
-    """
-    if not WRAPPER_URL:
-        raise HTTPException(502, "PRISM_WRAPPER_URL not set — no wrapper to subscribe to")
-
-    t0 = time.monotonic()
-    rows_loaded = 0
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream("GET", f"{WRAPPER_URL}/wal/subscribe",
-                                 params={"limit": count}) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.strip():
-                    continue
-                import json as _json
-                event = _json.loads(line)
-                _local_index.ingest(
-                    row_id=event["row_id"],
-                    text_repr=event["text_repr"],
-                    vector=event["vector"],
-                )
-                rows_loaded += 1
-
-    elapsed_ms = (time.monotonic() - t0) * 1000
-    _local_index._warmed_at = time.time()
-    _driver_stats["warmup_rows"] = rows_loaded
-    _driver_stats["warmup_duration_ms"] = elapsed_ms
-
-    logger.info("driver warmup: loaded %d rows in %.1fms", rows_loaded, elapsed_ms)
-    return {
-        "rows_loaded":  rows_loaded,
-        "elapsed_ms":   round(elapsed_ms, 1),
-        "index_size":   _local_index.size,
-        "throughput_rows_per_s": round(rows_loaded / (elapsed_ms / 1000), 0),
-    }
+@app.get("/driver/status")
+async def driver_status():
+    """Live state of PrismDriver subscription loop and local index."""
+    d = get_driver()
+    if d is None:
+        return {"enabled": False, "reason": "PRISM_WRAPPER_URL not set"}
+    return {"enabled": True, "wrapper_url": WRAPPER_URL, **d.index_status}
 
 
 @app.post("/driver/baseline")
 async def driver_baseline(text: str = Query(..., min_length=1)):
     """
-    BASELINE path: proxy the query to the Server Wrapper over the network.
-    Simulates direct DB access — every query pays the network round-trip.
+    BASELINE path — proxy every query to the DB node over the network.
+    Simulates direct DB access before PrismDriver is installed.
+    Every call pays the full Azure inter-container round-trip.
     """
     if not WRAPPER_URL:
         raise HTTPException(502, "PRISM_WRAPPER_URL not set")
 
     t0 = time.monotonic()
-    vector = _make_query_vector(text)
+    vector = _make_query_vector(text).tolist()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(f"{WRAPPER_URL}/query",
-                                 json={"vector": vector, "top_k": 5, "threshold": 0.5})
+        resp = await client.post(
+            f"{WRAPPER_URL}/query",
+            json={"vector": vector, "top_k": 5, "threshold": 0.5},
+        )
         resp.raise_for_status()
         data = resp.json()
 
     elapsed_ms = (time.monotonic() - t0) * 1000
-    _driver_stats["baseline_queries"] += 1
-    _driver_stats["baseline_total_ms"] += elapsed_ms
+    _baseline_stats["queries"] += 1
+    _baseline_stats["total_ms"] += elapsed_ms
 
     return {
         "results":    data.get("results", []),
         "elapsed_ms": round(elapsed_ms, 2),
         "source":     "db-node-network",
-        "index_size": _local_index.size,
     }
 
 
 @app.post("/driver/query")
 async def driver_query(text: str = Query(..., min_length=1)):
     """
-    DRIVER path: query the local in-process PrismResonance index.
-    Sub-millisecond — no network hop, data was pushed here by the wrapper.
+    DRIVER path — query the local PrismResonance index via PrismDriver.
+    The subscription loop has already streamed WAL rows into the index.
+    Sub-millisecond, zero network hops.
     """
-    vector = _make_query_vector(text)
-    results, elapsed_ms = _local_index.query(vector, top_k=5, threshold=0.5)
+    d = get_driver()
+    if d is None:
+        raise HTTPException(503, "PrismDriver not running — set PRISM_WRAPPER_URL")
 
-    _driver_stats["driver_queries"] += 1
-    _driver_stats["driver_total_ms"] += elapsed_ms
+    if not d.local_index.is_warm:
+        raise HTTPException(503, detail={
+            "error": "local index not yet warm",
+            "rows_received": d.local_index.rows_received,
+            "hint": "subscription loop is streaming — retry in a few seconds",
+        })
+
+    t0 = time.perf_counter()
+    vector = _make_query_vector(text)
+    results, elapsed_ms = d.local_index.query(vector, top_k=5, threshold=0.5)
 
     return {
-        "results":    results,
+        "results":    [
+            {"row_id": r.row_id, "text_repr": r.text_repr, "score": r.score}
+            for r in results
+        ],
         "elapsed_ms": round(elapsed_ms, 3),
         "source":     "local-index",
-        "index_size": _local_index.size,
+        "index_size": d.local_index.size,
     }
 
 
 @app.get("/driver/metrics")
 async def driver_metrics():
     """Comparison metrics: baseline (network) vs driver (local index)."""
-    bs_q   = _driver_stats["baseline_queries"]
-    drv_q  = _driver_stats["driver_queries"]
-    bs_avg = (_driver_stats["baseline_total_ms"] / bs_q) if bs_q else 0
-    drv_avg= (_driver_stats["driver_total_ms"] / drv_q)  if drv_q else 0
-    speedup= (bs_avg / drv_avg) if drv_avg > 0 else 0
+    d = get_driver()
+    bs_q   = _baseline_stats["queries"]
+    bs_avg = (_baseline_stats["total_ms"] / bs_q) if bs_q else 0.0
+
+    drv_q   = d.local_index.query_count if d else 0
+    drv_avg = d.local_index.avg_latency_ms if d else 0.0
+    speedup = (bs_avg / drv_avg) if drv_avg > 0 else 0.0
 
     return {
         "baseline": {
@@ -493,21 +407,22 @@ async def driver_metrics():
             "queries":        drv_q,
             "avg_latency_ms": round(drv_avg, 3),
             "source":         "local-index",
+            "index_size":     d.local_index.size if d else 0,
+            "rows_received":  d.local_index.rows_received if d else 0,
         },
-        "speedup_factor":    round(speedup, 1),
-        "index_size":        _local_index.size,
-        "warmup_rows":       _driver_stats["warmup_rows"],
-        "warmup_duration_ms": round(_driver_stats["warmup_duration_ms"], 1),
-        "wrapper_url":       WRAPPER_URL or "not-configured",
+        "speedup_factor": round(speedup, 1),
+        "wrapper_url":    WRAPPER_URL or "not-configured",
+        "sub_status":     d.index_status if d else None,
     }
 
 
 @app.post("/driver/reset")
 async def driver_reset():
-    """Reset the local index and all driver stats (start a fresh test run)."""
-    evicted = _local_index.reset()
-    for k in _driver_stats:
-        _driver_stats[k] = 0 if isinstance(_driver_stats[k], int) else 0.0
+    """Reset local index and baseline stats — start a fresh test run."""
+    d = get_driver()
+    evicted = d.local_index.reset() if d else 0
+    _baseline_stats["queries"] = 0
+    _baseline_stats["total_ms"] = 0.0
     return {"evicted": evicted}
 
 
