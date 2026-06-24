@@ -275,10 +275,11 @@ def get_seed_questions(n: int = 5000) -> list[str]:
     paraphrases = [p for _, ps in _CLUSTERS for p in ps]
     random.shuffle(paraphrases)
 
-    # Fill up to n
+    # Fill up to n by cycling through cluster paraphrases
+    idx = 0
     while len(questions) < n:
-        questions.extend(_CLUSTERS[i % len(_CLUSTERS)][1])
-        i = (len(questions) // len(_CLUSTERS[0][1])) + 1
+        questions.extend(_CLUSTERS[idx % len(_CLUSTERS)][1])
+        idx += 1
 
     return questions[:n]
 
