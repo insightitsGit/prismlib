@@ -22,17 +22,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-[project.urls]
-Homepage = "https://github.com/insightitsGit/prismlib"
-Repository = "https://github.com/insightitsGit/prismlib"
-"Bug Tracker" = "https://github.com/insightitsGit/prismlib/issues"
-
 # Core — always installed
 dependencies = [
     "numpy>=1.26.0",
     "onnxruntime>=1.17.0",
     "onnx>=1.15.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/insightitsGit/prismlib"
+Repository = "https://github.com/insightitsGit/prismlib"
+"Bug Tracker" = "https://github.com/insightitsGit/prismlib/issues"
 
 [project.optional-dependencies]
 
