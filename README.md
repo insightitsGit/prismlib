@@ -1,5 +1,10 @@
 # PrismLib
 
+[![PyPI version](https://img.shields.io/pypi/v/prismlib.svg)](https://pypi.org/project/prismlib/)
+[![Python 3.11+](https://img.shields.io/pypi/pyversions/prismlib.svg)](https://pypi.org/project/prismlib/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub](https://img.shields.io/badge/github-insightitsGit%2Fprismlib-black?logo=github)](https://github.com/insightitsGit/prismlib)
+
 **Tensor-native semantic cache and distributed data plane.**
 
 Two products, one mathematical core:
@@ -428,11 +433,28 @@ PrismLib is open source (Apache 2.0) and free to use. If your team needs any of 
 
 ## Publishing to PyPI
 
+**It is one package** — `prismlib` — published once. The wrapper, driver, and cache are all extras of the same package. Users install what they need:
+
 ```bash
+pip install "prismlib[cache]"           # PrismCache only
+pip install "prismlib[wrapper]"         # Server Wrapper (DB node)
+pip install "prismlib[fabric]"          # DLL Driver (App node)
+pip install "prismlib[all]"             # Everything
+```
+
+**To publish a new version:**
+
+```bash
+# 1. Bump version in pyproject.toml (currently 0.3.0)
+# 2. Build the distribution
 pip install build twine
 python -m build
+
+# 3. Upload to PyPI (use your token from pypi.org/manage/account/token/)
 python -m twine upload dist/* --username __token__ --password pypi-YOUR_TOKEN
 ```
+
+That's it. One upload covers all three install variants — PyPI resolves the extras automatically.
 
 ---
 
