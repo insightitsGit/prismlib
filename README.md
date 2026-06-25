@@ -431,6 +431,18 @@ PrismLib is open source (Apache 2.0) and free to use. If your team needs any of 
 
 ---
 
+## Sponsors
+
+PrismLib is free and will stay free. If it saved your team money on OpenAI bills or database infrastructure, consider sponsoring — it covers benchmark compute, maintenance time, and keeps development moving.
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/insightitsGit)
+
+<!-- sponsors -->
+*Your name or logo here — [become a sponsor](https://github.com/sponsors/insightitsGit)*
+<!-- /sponsors -->
+
+---
+
 ## Publishing to PyPI
 
 **It is one package** — `prismlib` — published once. The wrapper, driver, and cache are all extras of the same package. Users install what they need:
