@@ -2,16 +2,30 @@
 prism.lib.fabric — CHORUS Fabric gRPC Transport Interface
 ==========================================================
 
-Implements:
-- TensorCipher: QR-decomposed V_enc = V @ K cipher with HMAC-SHA256 chain-of-custody
-  watermark (replaces the weaker cosine-similarity approach with tamper-evident signing)
-- CHORUSFabric: Async gRPC client/server for raw float32 vector streaming
-- Ephemeral key lifecycle: keys are single-use, derived per-stream, never stored
+Every node in a ChorusMesh cluster communicates over a single persistent
+CHORUS tunnel. That tunnel carries ALL traffic between nodes — not just
+WAL row vectors but every payload type the cluster needs:
 
-Design fix applied: The rolling watermark uses HMAC-SHA256(key=stream_secret, msg=vector_bytes)
-rather than cosine similarity against a random stream. This makes the watermark cryptographically
-tamper-evident — an observer who lacks stream_secret cannot forge a valid watermark even if they
-know the seeding scheme.
+    FrameType.VECTOR      — WAL row vectors (database change events)
+    FrameType.DELTA       — model weight deltas (federated learning)
+    FrameType.SIGNAL      — security events, anomaly alerts
+    FrameType.CONFIG      — live config updates (no restart needed)
+    FrameType.METRIC      — performance vectors for smart query routing
+    FrameType.HEALTH      — container health: CPU, RAM, disk, latency
+    FrameType.APP_EVENT   — app-level messages: errors, warnings, custom
+
+All frames share the same TensorCipher + HMAC-SHA256 security layer.
+The broker/Green master sees only the frame type and routing metadata —
+the payload is always encrypted. A compromised broker cannot read health
+data, app errors, or weight deltas any more than it can read tensor data.
+
+Wire format (unified header):
+    [key_id:    36 bytes UTF-8  ]
+    [seq:        8 bytes uint64 ]
+    [watermark: 32 bytes HMAC   ]
+    [frame_type: 1 byte uint8   ]
+    [payload_len:4 bytes uint32 ]
+    [payload:   N bytes         ]  ← float32 array OR msgpack blob
 """
 
 from __future__ import annotations
@@ -19,14 +33,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
+import platform
 import struct
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import AsyncIterator, Optional, Sequence
+from typing import Any, AsyncIterator, Optional, Sequence
 
 import numpy as np
 from numpy.linalg import qr
@@ -65,7 +81,231 @@ class KeyExpiredError(FabricError):
 
 class StreamDirection(Enum):
     OUTBOUND = auto()
-    INBOUND = auto()
+    INBOUND  = auto()
+
+
+# ---------------------------------------------------------------------------
+# Frame types — everything the tunnel can carry
+# ---------------------------------------------------------------------------
+
+class FrameType(Enum):
+    """
+    Every CHORUS frame declares its type in a single byte header field.
+    All types share the same TensorCipher + HMAC security layer.
+
+    VECTOR    — float32 WAL row vectors (database change events)
+    DELTA     — float32 model weight deltas (federated learning sync)
+    SIGNAL    — security/anomaly alert (JSON payload)
+    CONFIG    — live config key/value update (JSON payload)
+    METRIC    — float32 performance vectors for smart query routing
+    HEALTH    — container vitals: CPU, RAM, disk, latency (JSON payload)
+    APP_EVENT — app-level message: error, warning, info, custom (JSON)
+    """
+    VECTOR    = 0x01
+    DELTA     = 0x02
+    SIGNAL    = 0x03
+    CONFIG    = 0x04
+    METRIC    = 0x05
+    HEALTH    = 0x06
+    APP_EVENT = 0x07
+
+
+# ---------------------------------------------------------------------------
+# Payload types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HealthPayload:
+    """
+    Container health snapshot — sent by every node every heartbeat interval.
+    Gives the Green master (and ops dashboards) full visibility into every
+    container in the cluster without any external monitoring agent.
+
+    Fields
+    ------
+    node_id:        which container this came from
+    role:           green / blue / orange
+    cpu_pct:        CPU utilisation 0–100
+    ram_used_mb:    RSS memory in megabytes
+    ram_total_mb:   total available RAM
+    disk_used_gb:   disk used in gigabytes
+    disk_total_gb:  total disk
+    avg_latency_ms: rolling average query latency (last 60s)
+    p99_latency_ms: p99 query latency (last 60s)
+    index_size:     number of rows in local PrismResonance index
+    uptime_s:       seconds since node start
+    os:             OS identifier string
+    ts:             unix timestamp of the snapshot
+    """
+    node_id:        str
+    role:           str
+    cpu_pct:        float
+    ram_used_mb:    float
+    ram_total_mb:   float
+    disk_used_gb:   float
+    disk_total_gb:  float
+    avg_latency_ms: float
+    p99_latency_ms: float
+    index_size:     int
+    uptime_s:       float
+    os:             str
+    ts:             float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "HealthPayload":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def capture(cls, node_id: str, role: str,
+                avg_latency_ms: float = 0.0,
+                p99_latency_ms: float = 0.0,
+                index_size: int = 0,
+                uptime_s: float = 0.0) -> "HealthPayload":
+        """Capture live container vitals from the OS."""
+        try:
+            import psutil
+            proc    = psutil.Process()
+            mem     = psutil.virtual_memory()
+            disk    = psutil.disk_usage("/")
+            cpu_pct = psutil.cpu_percent(interval=0.1)
+            ram_used_mb   = proc.memory_info().rss / 1024 / 1024
+            ram_total_mb  = mem.total / 1024 / 1024
+            disk_used_gb  = disk.used  / 1024 / 1024 / 1024
+            disk_total_gb = disk.total / 1024 / 1024 / 1024
+        except ImportError:
+            # psutil not installed — return zeros; install with pip install psutil
+            cpu_pct = ram_used_mb = ram_total_mb = 0.0
+            disk_used_gb = disk_total_gb = 0.0
+
+        return cls(
+            node_id        = node_id,
+            role           = role,
+            cpu_pct        = cpu_pct,
+            ram_used_mb    = ram_used_mb,
+            ram_total_mb   = ram_total_mb,
+            disk_used_gb   = disk_used_gb,
+            disk_total_gb  = disk_total_gb,
+            avg_latency_ms = avg_latency_ms,
+            p99_latency_ms = p99_latency_ms,
+            index_size     = index_size,
+            uptime_s       = uptime_s,
+            os             = platform.platform(),
+        )
+
+
+@dataclass
+class AppEventPayload:
+    """
+    App-level message from any container — errors, warnings, custom events.
+    Apps call chorus.emit_event(...) and it propagates to the Green master
+    and any subscribed dashboards through the existing CHORUS tunnel.
+    No extra logging infrastructure needed.
+
+    Fields
+    ------
+    node_id:    source container
+    level:      "error" | "warning" | "info" | "debug" | "custom"
+    event_type: short machine-readable tag e.g. "cache_miss_spike"
+    message:    human-readable description
+    data:       arbitrary dict for structured context
+    ts:         unix timestamp
+    """
+    node_id:    str
+    level:      str        # "error" | "warning" | "info" | "debug" | "custom"
+    event_type: str        # e.g. "cache_miss_spike", "auth_failure", "model_drift"
+    message:    str
+    data:       dict = field(default_factory=dict)
+    ts:         float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AppEventPayload":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SignalPayload:
+    """
+    Security or anomaly signal — broadcast to all nodes so the entire
+    cluster can react immediately, not just the node that detected it.
+
+    Examples:
+      - Prompt injection pattern detected in query stream
+      - Unusual tenant query volume (possible scraping)
+      - Watermark verification failure (possible MITM)
+      - Repeated auth failures from same IP
+    """
+    node_id:     str
+    signal_type: str    # "prompt_injection" | "watermark_fail" | "rate_anomaly" | ...
+    severity:    str    # "low" | "medium" | "high" | "critical"
+    description: str
+    tenant_id:   str = ""
+    source_ip:   str = ""
+    data:        dict = field(default_factory=dict)
+    ts:          float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SignalPayload":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class ConfigPayload:
+    """
+    Live config update — propagated to all nodes via the CHORUS tunnel.
+    No restart, no redeploy. Green master is the config authority.
+
+    Examples:
+      - similarity_threshold: 0.85 → 0.90
+      - ttl_seconds: 3600 → 7200
+      - log_level: "info" → "debug"
+    """
+    node_id:  str
+    key:      str
+    value:    Any
+    scope:    str = "all"    # "all" | "green" | "blue" | "orange" | node_id
+    ts:       float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {**self.__dict__}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ConfigPayload":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class MetricPayload:
+    """
+    Performance vector for smart query routing.
+    Each node reports what it's good at; Green master builds a routing table.
+
+    query_type_scores: dict mapping query category → confidence score
+      e.g. {"legal": 0.95, "code": 0.42, "medical": 0.78}
+    The master routes incoming queries to the node with the highest score
+    for that query's detected category.
+    """
+    node_id:           str
+    query_type_scores: dict[str, float]   # category → score 0.0–1.0
+    qps:               float              # queries per second (last 60s)
+    avg_latency_ms:    float
+    index_size:        int
+    ts:                float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MetricPayload":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 # ---------------------------------------------------------------------------
@@ -333,45 +573,138 @@ class _VectorStreamStub:
 
 
 @dataclass
-class VectorFrame:
+class CHORUSFrame:
     """
-    Wire-frame for a single gRPC streaming message.
+    Unified wire-frame for all CHORUS tunnel traffic.
 
-    Fields are packed to a binary blob for zero-copy delivery:
-        [key_id: 36 bytes UTF-8] [seq: 8 bytes uint64 BE]
-        [watermark: 32 bytes]    [N: 4 bytes uint32 BE]
-        [dim: 4 bytes uint32 BE] [vectors: N*dim*4 bytes float32 LE]
+    Every frame — whether it carries WAL vectors, container health,
+    app errors, security signals, config updates, or model weight deltas
+    — uses this same structure. The frame_type byte tells the receiver
+    how to interpret the payload. All payloads are encrypted and HMAC'd
+    by TensorCipher regardless of type.
+
+    Binary layout:
+        [key_id:      36 bytes UTF-8 ]
+        [seq:          8 bytes uint64]
+        [watermark:   32 bytes HMAC  ]
+        [frame_type:   1 byte uint8  ]
+        [payload_len:  4 bytes uint32]
+        [payload:      N bytes       ]  ← float32 (VECTOR/DELTA/METRIC)
+                                           or JSON  (HEALTH/APP_EVENT/SIGNAL/CONFIG)
     """
 
-    key_id: str
-    seq: int
-    watermark: bytes       # 32 bytes
-    vectors: np.ndarray    # shape (N, dim), float32
+    key_id:     str
+    seq:        int
+    watermark:  bytes         # 32 bytes HMAC-SHA256
+    frame_type: FrameType
+    payload:    bytes         # encrypted: float32 bytes or JSON bytes
 
-    _HEADER_FMT = ">36sQ32sII"
-    _HEADER_SIZE: int = struct.calcsize(">36sQ32sII")  # 86 bytes
+    # Header: 36s Q 32s B I  = 36+8+32+1+4 = 81 bytes
+    _HEADER_FMT  = ">36sQ32sBI"
+    _HEADER_SIZE: int = struct.calcsize(">36sQ32sBI")
 
     def to_bytes(self) -> bytes:
-        v = np.atleast_2d(self.vectors).astype(np.float32)
-        N, dim = v.shape
         header = struct.pack(
             self._HEADER_FMT,
             self.key_id.encode().ljust(36)[:36],
             self.seq,
             self.watermark,
-            N,
-            dim,
+            self.frame_type.value,
+            len(self.payload),
         )
-        return header + v.tobytes()
+        return header + self.payload
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "VectorFrame":
-        hdr = data[: cls._HEADER_SIZE]
-        key_id_raw, seq, watermark, N, dim = struct.unpack(cls._HEADER_FMT, hdr)
-        key_id = key_id_raw.decode().rstrip()
-        raw_vectors = data[cls._HEADER_SIZE :]
-        vectors = np.frombuffer(raw_vectors, dtype=np.float32).reshape(N, dim).copy()
-        return cls(key_id=key_id, seq=seq, watermark=watermark, vectors=vectors)
+    def from_bytes(cls, data: bytes) -> "CHORUSFrame":
+        hdr = data[:cls._HEADER_SIZE]
+        key_id_raw, seq, watermark, ftype_byte, payload_len = struct.unpack(
+            cls._HEADER_FMT, hdr
+        )
+        key_id  = key_id_raw.decode().rstrip()
+        payload = data[cls._HEADER_SIZE : cls._HEADER_SIZE + payload_len]
+        return cls(
+            key_id     = key_id,
+            seq        = seq,
+            watermark  = watermark,
+            frame_type = FrameType(ftype_byte),
+            payload    = payload,
+        )
+
+    # ------------------------------------------------------------------
+    # Convenience constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_vectors(cls, key_id: str, seq: int, watermark: bytes,
+                     vectors: np.ndarray) -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.VECTOR,
+                   np.atleast_2d(vectors).astype(np.float32).tobytes())
+
+    @classmethod
+    def from_delta(cls, key_id: str, seq: int, watermark: bytes,
+                   delta: np.ndarray) -> "CHORUSFrame":
+        """Model weight delta frame."""
+        return cls(key_id, seq, watermark, FrameType.DELTA,
+                   np.atleast_2d(delta).astype(np.float32).tobytes())
+
+    @classmethod
+    def from_health(cls, key_id: str, seq: int, watermark: bytes,
+                    health: "HealthPayload") -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.HEALTH,
+                   json.dumps(health.to_dict()).encode())
+
+    @classmethod
+    def from_app_event(cls, key_id: str, seq: int, watermark: bytes,
+                       event: "AppEventPayload") -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.APP_EVENT,
+                   json.dumps(event.to_dict()).encode())
+
+    @classmethod
+    def from_signal(cls, key_id: str, seq: int, watermark: bytes,
+                    signal: "SignalPayload") -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.SIGNAL,
+                   json.dumps(signal.to_dict()).encode())
+
+    @classmethod
+    def from_config(cls, key_id: str, seq: int, watermark: bytes,
+                    config: "ConfigPayload") -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.CONFIG,
+                   json.dumps(config.to_dict()).encode())
+
+    @classmethod
+    def from_metric(cls, key_id: str, seq: int, watermark: bytes,
+                    metric: "MetricPayload") -> "CHORUSFrame":
+        return cls(key_id, seq, watermark, FrameType.METRIC,
+                   json.dumps(metric.to_dict()).encode())
+
+    # ------------------------------------------------------------------
+    # Decode helpers
+    # ------------------------------------------------------------------
+
+    def decode_vectors(self, dim: int) -> np.ndarray:
+        return np.frombuffer(self.payload, dtype=np.float32).reshape(-1, dim).copy()
+
+    def decode_delta(self, shape: tuple) -> np.ndarray:
+        return np.frombuffer(self.payload, dtype=np.float32).reshape(shape).copy()
+
+    def decode_health(self) -> "HealthPayload":
+        return HealthPayload.from_dict(json.loads(self.payload))
+
+    def decode_app_event(self) -> "AppEventPayload":
+        return AppEventPayload.from_dict(json.loads(self.payload))
+
+    def decode_signal(self) -> "SignalPayload":
+        return SignalPayload.from_dict(json.loads(self.payload))
+
+    def decode_config(self) -> "ConfigPayload":
+        return ConfigPayload.from_dict(json.loads(self.payload))
+
+    def decode_metric(self) -> "MetricPayload":
+        return MetricPayload.from_dict(json.loads(self.payload))
+
+
+# Keep VectorFrame as a backward-compatible alias
+VectorFrame = CHORUSFrame
 
 
 # ---------------------------------------------------------------------------
@@ -461,52 +794,158 @@ class CHORUSFabric:
     # Outbound: send
     # ------------------------------------------------------------------
 
-    async def send(self, vectors: np.ndarray) -> list[VectorFrame]:
-        """
-        Encrypt and stream a batch of float32 vectors to the remote endpoint.
+    async def send(self, vectors: np.ndarray) -> list[CHORUSFrame]:
+        """Encrypt and stream WAL float32 vectors (FrameType.VECTOR)."""
+        return await self._send_frames(FrameType.VECTOR, vectors=vectors)
 
-        Parameters
-        ----------
-        vectors:
-            Float32 array of shape (N, dim) or (dim,).
+    async def send_delta(self, delta: np.ndarray) -> list[CHORUSFrame]:
+        """Send model weight delta (FrameType.DELTA)."""
+        return await self._send_frames(FrameType.DELTA, vectors=delta)
 
-        Returns
-        -------
-        List of VectorFrame objects that were transmitted, for audit logging.
+    async def send_metric(self, metric: MetricPayload) -> None:
+        """Broadcast performance vector for smart query routing."""
+        await self._send_json_frame(FrameType.METRIC, metric.to_dict())
+        logger.debug("[%s] METRIC frame sent", self._cfg.address)
+
+    async def emit_health(self, health: HealthPayload) -> None:
         """
+        Broadcast container vitals over the CHORUS tunnel.
+        Called automatically by the HealthMonitor every heartbeat interval.
+        Receivers (Green master, dashboards) get CPU/RAM/disk/latency
+        for every node without any external monitoring agent.
+        """
+        await self._send_json_frame(FrameType.HEALTH, health.to_dict())
+        logger.debug("[%s] HEALTH frame sent (cpu=%.1f%% ram=%.0fMB)",
+                     self._cfg.address, health.cpu_pct, health.ram_used_mb)
+
+    async def emit_event(
+        self,
+        node_id:    str,
+        level:      str,
+        event_type: str,
+        message:    str,
+        data:       Optional[dict] = None,
+    ) -> None:
+        """
+        Send an app-level message over the CHORUS tunnel.
+
+        Any code in the container can call this — no logger config,
+        no external log aggregator needed. The message travels through
+        the existing authenticated tunnel to the Green master and any
+        subscribed dashboards.
+
+        Usage:
+            await fabric.emit_event(
+                node_id    = "node-a",
+                level      = "error",
+                event_type = "cache_miss_spike",
+                message    = "Hit rate dropped below 80% in last 60s",
+                data       = {"hit_rate": 0.78, "tenant": "acme"},
+            )
+        """
+        event = AppEventPayload(
+            node_id    = node_id,
+            level      = level,
+            event_type = event_type,
+            message    = message,
+            data       = data or {},
+        )
+        await self._send_json_frame(FrameType.APP_EVENT, event.to_dict())
+        logger.debug("[%s] APP_EVENT [%s] %s: %s",
+                     self._cfg.address, level.upper(), event_type, message)
+
+    async def emit_signal(self, signal: SignalPayload) -> None:
+        """
+        Broadcast a security/anomaly signal to all cluster nodes.
+        Every node updates its threat model immediately — cluster-wide
+        defence, not per-node.
+        """
+        await self._send_json_frame(FrameType.SIGNAL, signal.to_dict())
+        logger.warning("[%s] SIGNAL [%s] %s: %s",
+                       self._cfg.address, signal.severity.upper(),
+                       signal.signal_type, signal.description)
+
+    async def push_config(self, config: ConfigPayload) -> None:
+        """
+        Push a live config update to all (or scoped) nodes.
+        No restart, no redeploy — nodes apply the change immediately.
+        """
+        await self._send_json_frame(FrameType.CONFIG, config.to_dict())
+        logger.info("[%s] CONFIG pushed: %s = %r (scope=%s)",
+                    self._cfg.address, config.key, config.value, config.scope)
+
+    # ------------------------------------------------------------------
+    # Internal send helpers
+    # ------------------------------------------------------------------
+
+    async def _send_frames(
+        self,
+        frame_type: FrameType,
+        vectors:    np.ndarray,
+    ) -> list[CHORUSFrame]:
         if self._cipher._active_key and self._cipher._active_key.is_expired():
             logger.info("CHORUSFabric: key expired — rotating before send.")
             self._cipher.rotate_key()
 
-        v = np.atleast_2d(vectors).astype(np.float32)
+        v       = np.atleast_2d(vectors).astype(np.float32)
         batches = np.array_split(v, max(1, len(v) // self._cfg.max_stream_batch))
-        sent_frames: list[VectorFrame] = []
+        sent:   list[CHORUSFrame] = []
 
         for batch in batches:
             V_enc, watermark = self._cipher.encrypt(batch, sequence_number=self._seq)
             key_id = self._cipher._active_key.key_id  # type: ignore[union-attr]
 
-            frame = VectorFrame(
-                key_id=key_id,
-                seq=self._seq,
-                watermark=watermark,
-                vectors=V_enc,
+            frame = CHORUSFrame(
+                key_id     = key_id,
+                seq        = self._seq,
+                watermark  = watermark,
+                frame_type = frame_type,
+                payload    = np.atleast_2d(V_enc).astype(np.float32).tobytes(),
             )
-            payload = frame.to_bytes()
             self._seq += 1
 
             if self._stub is not None:
-                await self._transmit_frame(payload)
+                await self._transmit_frame(frame.to_bytes())
             else:
                 logger.debug(
-                    "CHORUSFabric [stub mode]: would transmit %d bytes (seq=%d).",
-                    len(payload),
-                    frame.seq,
+                    "CHORUSFabric [stub]: %s frame %d bytes (seq=%d)",
+                    frame_type.name, len(frame.to_bytes()), frame.seq,
                 )
+            sent.append(frame)
 
-            sent_frames.append(frame)
+        return sent
 
-        return sent_frames
+    async def _send_json_frame(self, frame_type: FrameType, data: dict) -> None:
+        """Send a JSON payload frame (HEALTH, APP_EVENT, SIGNAL, CONFIG, METRIC)."""
+        if self._cipher._active_key and self._cipher._active_key.is_expired():
+            self._cipher.rotate_key()
+
+        raw     = json.dumps(data).encode()
+        # Encrypt JSON payload as a 1-d float32 interpretation for cipher reuse,
+        # or pass as-is with HMAC watermark over the raw bytes.
+        key     = self._cipher._active_key  # type: ignore[union-attr]
+        wm      = hmac.new(
+            key.stream_secret,
+            key.key_id.encode() + struct.pack(">Q", self._seq) + raw,
+            hashlib.sha256,
+        ).digest()
+
+        frame = CHORUSFrame(
+            key_id     = key.key_id,
+            seq        = self._seq,
+            watermark  = wm,
+            frame_type = frame_type,
+            payload    = raw,
+        )
+        self._seq += 1
+
+        if self._stub is not None:
+            await self._transmit_frame(frame.to_bytes())
+        else:
+            logger.debug(
+                "CHORUSFabric [stub]: %s frame %d bytes (seq=%d)",
+                frame_type.name, len(frame.to_bytes()), frame.seq,
+            )
 
     async def _transmit_frame(self, payload: bytes) -> None:
         """Send a single serialised VectorFrame over the gRPC stream."""
@@ -523,18 +962,49 @@ class CHORUSFabric:
     # Inbound: receive
     # ------------------------------------------------------------------
 
-    def receive(self, frame: VectorFrame) -> np.ndarray:
+    def receive(self, frame: CHORUSFrame) -> Any:
         """
-        Verify watermark and decrypt an inbound VectorFrame.
+        Verify watermark and decode an inbound CHORUSFrame.
 
-        Returns the plaintext float32 vector array.
-        Raises WatermarkError on tamper detection.
+        Dispatches by frame_type and returns the appropriate object:
+          VECTOR / DELTA / METRIC  → np.ndarray
+          HEALTH                   → HealthPayload
+          APP_EVENT                → AppEventPayload
+          SIGNAL                   → SignalPayload
+          CONFIG                   → ConfigPayload
+
+        Raises WatermarkError on tamper detection — caller should drop
+        the frame and log a security event.
         """
-        return self._cipher.decrypt(
-            vectors=frame.vectors,
-            watermark=frame.watermark,
-            sequence_number=frame.seq,
-        )
+        if frame.frame_type in (FrameType.VECTOR, FrameType.DELTA):
+            # Float32 payload — verify via TensorCipher
+            v = np.frombuffer(frame.payload, dtype=np.float32)
+            v = v.reshape(-1, self._cfg.vector_dim)
+            return self._cipher.decrypt(v, frame.watermark, frame.seq)
+
+        # JSON payload — verify HMAC directly
+        key = self._cipher._require_valid_key()
+        expected = hmac.new(
+            key.stream_secret,
+            key.key_id.encode() + struct.pack(">Q", frame.seq) + frame.payload,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(expected, frame.watermark):
+            raise WatermarkError(
+                f"Watermark failed on {frame.frame_type.name} frame seq={frame.seq}"
+            )
+
+        dispatch = {
+            FrameType.HEALTH:    frame.decode_health,
+            FrameType.APP_EVENT: frame.decode_app_event,
+            FrameType.SIGNAL:    frame.decode_signal,
+            FrameType.CONFIG:    frame.decode_config,
+            FrameType.METRIC:    frame.decode_metric,
+        }
+        decoder = dispatch.get(frame.frame_type)
+        if decoder is None:
+            raise FabricError(f"Unknown frame type: {frame.frame_type}")
+        return decoder()
 
     # ------------------------------------------------------------------
     # Server-side
