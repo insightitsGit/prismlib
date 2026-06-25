@@ -5,21 +5,45 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![GitHub](https://img.shields.io/badge/github-insightitsGit%2Fprismlib-black?logo=github)](https://github.com/insightitsGit/prismlib)
 
-**Tensor-native semantic cache and distributed data plane.**
+**Tensor-native LLM cache, distributed DB driver, and cluster intelligence — one package.**
 
-Two products, one mathematical core:
+PrismLib has three layers. Use any combination:
 
-| Product | Component | Deployed on | Install |
-|---------|-----------|-------------|---------|
-| **PrismCache** | In-process LLM cache | App node | `pip install "prismlib[cache]"` |
-| **PrismDriver** | **Server Wrapper** (daemon) | **DB node** | `pip install "prismlib[wrapper]"` |
-| **PrismDriver** | **DLL Driver** (in-process) | **App node** | `pip install "prismlib[fabric]"` |
+| Layer | What it solves | Key number | Install |
+|-------|---------------|-----------|---------|
+| **PrismCache** | LLM API cost — semantic cache catches repeated & paraphrased queries in-process | **91–96% hit rate** | `pip install "prismlib[cache]"` |
+| **PrismDriver** | DB read latency — WAL-streamed local index replaces network round-trips | **98.6% latency reduction** (143ms → 2ms) | `pip install "prismlib[fabric]"` |
+| **PrismLib Micro** | Cluster token cost + HA — shares answers across containers, auto-failover, health mesh | **76% fewer tokens cluster-wide** | included in `prismlib[fabric]` |
 
-PrismDriver is a two-node system: the **Server Wrapper** runs as an OS daemon on the same machine as your database, intercepts WAL/binlog changes, vectorizes rows, and streams them over CHORUS Fabric to the **DLL Driver** on your app server. The driver keeps a local PrismResonance index warm so reads never leave the process.
+All three run entirely in-process. No Redis. No Pinecone. No Prometheus. No Kubernetes operator.
+
+---
+
+### PrismCache — single node, in-process LLM cache
+
+Wraps any LLM call. Paraphrased queries return the cached answer without touching the API.
+Multi-tenant math: JL projection seeded by `SHA-256(tenant_id)` gives each tenant a mathematically
+isolated address space — not a query filter, a projection matrix.
+
+### PrismDriver — two-node WAL-streaming DB driver
+
+Two components on two machines:
+- **Server Wrapper** (DB node) — intercepts WAL/binlog, vectorizes rows, streams encrypted float32 frames via CHORUS Fabric
+- **DLL Driver** (app node) — subscribes to the stream, keeps a local PrismResonance index warm; reads never leave the process
+
+### PrismLib Micro — cluster cache, health mesh, Blue/Green/Orange failover
+
+Built into `prismlib[fabric]`, zero extra install:
+- **ClusterCache** — once any node answers a query, every peer caches it via CHORUS TOKEN_SYNC frames. BLUE and ORANGE nodes billed 0 tokens on warm queries.
+- **AlertManager** — 12 default health rules; fires SIGNAL frame + admin email in <1s when CPU/RAM/disk thresholds are crossed. No scrape interval. No Datadog agent.
+- **Blue/Green/Orange failover** — GREEN is active master, BLUE is warm standby (auto-promotes in ~3s if GREEN goes silent), ORANGE is syncing reserve.
+- **ContextCompressor** — cosine-sim top-K chunk selection before every LLM call. 58–64% context token reduction, zero extra cost.
+
+---
 
 Built on two open-source InsightIts libraries:
-- **[PrismResonance](https://github.com/insightitsGit/prismresonance)** — the wave-memory similarity engine powering every cache lookup and local vector index
-- **[CHORUS Fabric](https://github.com/insightitsGit/chorus_fabric)** — the gRPC binary streaming protocol that carries encrypted float32 tensor frames from the Server Wrapper to the DLL Driver
+- **[PrismResonance](https://github.com/insightitsGit/prismresonance)** — wave-memory similarity engine powering every cache lookup and local vector index
+- **[CHORUS Fabric](https://github.com/insightitsGit/chorus_fabric)** — encrypted gRPC binary streaming protocol carrying float32 tensor frames between nodes
 
 ---
 
@@ -292,30 +316,42 @@ $results = $driver->query($embedding, topK: 5, threshold: 0.85);
 ┌─ DB Node ──────────────────────────────────────────────────────┐
 │  PostgreSQL / MySQL / CockroachDB / TiDB                       │
 │       │ WAL / binlog / changefeed                              │
-│  ┌────▼────────────────────────────────────────────────────┐   │
-│  │  prism-wrapper  (pip install "prismlib[wrapper]")       │   │
-│  │  RowVectorizer → TensorCipher (V_enc = V @ K)          │   │
-│  │  → HMAC-SHA256 watermark → CHORUSPublisher             │   │
-│  └────────────────────────┬────────────────────────────────┘   │
+│  ┌────▼───────────────────────────────────────────────────┐    │
+│  │  prism-wrapper  (pip install "prismlib[wrapper]")      │    │
+│  │  RowVectorizer → TensorCipher (V_enc = V @ K)         │    │
+│  │  → HMAC-SHA256 watermark → CHORUSPublisher            │    │
+│  └────────────────────────┬───────────────────────────────┘    │
 └───────────────────────────┼────────────────────────────────────┘
-                            │  CHORUS Fabric  (gRPC, port 50051)
-                            │  encrypted float32 frames
-┌─ App Node ────────────────┼────────────────────────────────────┐
-│  ┌────────────────────────▼───────────────────────────────┐    │
-│  │  PrismDriver DLL  (pip install "prismlib[fabric]")     │    │
-│  │  Subscribe loop → decrypt → PrismResonance index       │    │
-│  └──────────────────────────────────────────┬─────────────┘    │
-│                                             │ sub-ms query     │
-│  ┌──────────────────────────────────────────▼─────────────┐    │
-│  │  Your Application                                       │    │
-│  │  ┌──────────────────┐   ┌───────────────────────────┐  │    │
-│  │  │  PrismCache      │   │  PrismDriver              │  │    │
-│  │  │  LLM cache       │   │  local PrismResonance     │  │    │
-│  │  │  pip install     │   │  (no DB round-trip)       │  │    │
-│  │  │  prismlib[cache] │   │                           │  │    │
-│  │  └──────────────────┘   └───────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────────────────────┘
+                            │  CHORUS Fabric (gRPC, encrypted float32)
+┌─ App Node — GREEN ────────┼────────────────────────────────────┐
+│  ┌────────────────────────▼──────────────────────────────┐     │
+│  │  PrismDriver DLL  (pip install "prismlib[fabric]")    │     │
+│  │  Subscribe loop → decrypt → PrismResonance index      │     │
+│  └──────────────────────────┬────────────────────────────┘     │
+│                             │ sub-ms query                     │
+│  ┌──────────────────────────▼────────────────────────────┐     │
+│  │  Your Application                                      │     │
+│  │  ┌─────────────────┐   ┌──────────────────────────┐   │     │
+│  │  │  PrismCache     │   │  PrismDriver             │   │     │
+│  │  │  LLM cache      │   │  local PrismResonance    │   │     │
+│  │  │  [cache]        │   │  (no DB round-trip)      │   │     │
+│  │  └─────────────────┘   └──────────────────────────┘   │     │
+│  │  ┌──────────────────────────────────────────────────┐  │     │
+│  │  │  ClusterCache  ← TOKEN_SYNC frames               │  │     │
+│  │  │  AlertManager  ← HEALTH / SIGNAL frames          │  │     │
+│  │  └──────────────────────────────────────────────────┘  │     │
+│  └────────────────────────────────────────────────────────┘     │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │  CHORUS mesh
+          ┌────────────────────┴────────────────────┐
+          │  TOKEN_SYNC · HEALTH · SIGNAL · CONFIG   │
+          ▼                                          ▼
+┌─ App Node — BLUE ──────┐           ┌─ App Node — ORANGE ─────┐
+│  ClusterCache          │           │  ClusterCache            │
+│  (warm standby)        │           │  (syncing reserve)       │
+│  auto-promotes if      │           │  separate network        │
+│  GREEN silent >3s      │           │                          │
+└────────────────────────┘           └──────────────────────────┘
 ```
 
 ---
