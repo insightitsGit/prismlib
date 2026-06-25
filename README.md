@@ -1,6 +1,6 @@
 # PrismLib
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.3.0-blue.svg)](https://pypi.org/project/prismlib/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.4.0-blue.svg)](https://pypi.org/project/prismlib/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/prismlib/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![GitHub](https://img.shields.io/badge/github-insightitsGit%2Fprismlib-black?logo=github)](https://github.com/insightitsGit/prismlib)
@@ -415,6 +415,94 @@ CHORUS Fabric is the same protocol used in the CHORUS M2M system — InsightIts'
 
 ---
 
+## PrismLib Micro — Cluster & RAG Layer (v0.4.0)
+
+PrismLib Micro is the cluster layer built into `prismlib[fabric]`. It adds three
+capabilities on top of the single-node stack — no extra install, no extra infra.
+
+### What's included
+
+| Component | What it does |
+|-----------|-------------|
+| **ClusterCache** | Shares LLM answers across all nodes via CHORUS TOKEN_SYNC frames. Once any node answers a query, every other node serves it for 0 tokens. |
+| **AlertManager** | Broadcasts health alerts as SIGNAL frames + admin email the moment CPU/RAM/disk/latency thresholds are crossed. No Prometheus. No Datadog. |
+| **Blue/Green/Orange failover** | Three-tier hot-standby: GREEN (active), BLUE (warm standby, auto-promotes in ~3s), ORANGE (syncing reserve). No Raft dependency. No K8s operator. |
+| **ContextCompressor** | Ranks RAG context chunks by cosine similarity, keeps top-K. Saves 58–64% of context tokens before every LLM call. In-process, no extra model. |
+
+### Cluster benchmark results (3-node, live run)
+
+| Metric | Result |
+|--------|--------|
+| Token savings — cluster avg | **76.1%** |
+| BLUE node (cluster cache hit) | **100%** — 0 LLM calls |
+| ORANGE node (cross-network cache hit) | **100%** — 0 LLM calls |
+| Context compression | **58–64%** per query |
+| Health alert propagation | **<1 s** (709–711 ms measured) |
+| Failover — BLUE promoted to GREEN | **~3–4 s**, no human step |
+
+See [`benchmark/cluster/`](benchmark/cluster/) for the full benchmark code and [`benchmark/cluster/cluster_benchmark_results.json`](benchmark/cluster/cluster_benchmark_results.json) for raw results.
+
+### ClusterCache — 5-line RAG integration
+
+```python
+from prism.cluster.cache import ClusterCache
+
+cache = ClusterCache(node_id="node-1", fabric=chorus_fabric)
+
+answer = await cache.get_or_call(
+    query          = user_question,
+    query_vector   = embed(user_question),
+    call_fn        = lambda: llm.complete(user_question),
+    context_chunks = retrieved_docs,    # your RAG chunks
+    chunk_vectors  = doc_embeddings,    # their vectors
+)
+```
+
+Drop this in front of your existing `retrieve → generate` step. No changes to
+retrieval logic, no changes to your LLM client.
+
+### AlertManager — email + SIGNAL frame on health threshold
+
+```python
+from prism.cluster.alerts import AlertManager, SMTPConfig
+
+alerts = AlertManager(
+    fabric = chorus_fabric,
+    mail_config = SMTPConfig(
+        host="smtp.gmail.com", port=587,
+        username="you@gmail.com",
+        password=os.getenv("GMAIL_APP_PASS"),
+        recipients=["admin@yourcompany.com"],
+    ),
+)
+await alerts.evaluate_health(health_snapshot)
+# Fires email + SIGNAL frame to all nodes if any of the 12 default rules trigger
+```
+
+### Competitive position
+
+| Capability | PrismLib Micro | Prometheus + Alertmanager | Redis cluster | Raft / etcd |
+|-----------|---------------|--------------------------|---------------|-------------|
+| Cross-node token cache | **Yes, built-in** | No | Manual (exact match) | No |
+| Alert propagation | **<1 s, no infra** | 30–60 s, stack needed | No | No |
+| Auto failover | **~3–4 s, built-in** | No | Sentinel, 2–30 s | **150–500 ms** |
+| Context compression | **58–64%, free** | No | No | No |
+| Extra infrastructure | **None** | Prometheus stack | Redis cluster | etcd cluster |
+
+### Pricing
+
+| Tier | Nodes | Price | Includes |
+|------|-------|-------|---------|
+| **Open source** | Unlimited | **Free forever** | All cluster code, Apache 2.0 |
+| **ChorusMesh Developer** *(coming soon)* | Up to 3 | $29/mo after 30-day trial | ClusterCache + failover + AlertManager |
+| **ChorusMesh Team** | Up to 10 | $149/mo | + Raft consensus, message broker adapters |
+| **ChorusMesh Business** | Up to 50 | $499/mo | + multi-region routing, SLA 99.9% |
+| **Enterprise** | Unlimited | Contact us | + air-gap, compliance, dedicated Slack |
+
+For enterprise agreements: **[insightits.info@gmail.com](mailto:insightits.info@gmail.com)**
+
+---
+
 ## Enterprise
 
 PrismLib is open source (Apache 2.0) and free to use. If your team needs any of the following, contact us for enterprise pricing:
@@ -457,7 +545,7 @@ pip install "prismlib[all]"             # Everything
 **To publish a new version:**
 
 ```bash
-# 1. Bump version in pyproject.toml (currently 0.3.0)
+# 1. Bump version in pyproject.toml (currently 0.4.0)
 # 2. Build the distribution
 pip install build twine
 python -m build
