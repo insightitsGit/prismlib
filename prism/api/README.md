@@ -149,26 +149,39 @@ All other dependencies (`prism.lib.fabric`, `prism.lib.lang`, `prism.lib.resonan
 
 ## Benchmark Results
 
-Measured on a 61-document corpus, 15 queries, top-5, all-MiniLM-L6-v2 (384-dim → 64-dim JL):
+61-document corpus, 15 queries, top-5, all-MiniLM-L6-v2 (384-dim → JL projection).
 
-| Metric | Baseline (HTTP/REST) | PrismAPI (CHORUS) |
-|--------|---------------------|-------------------|
-| Embedding calls — 15 queries | **90 calls** | **15 calls** |
-| Embedding calls per query | 6.0 (1 query + 5 results) | 1.0 (query only) |
-| **Embedding calls saved** | — | **83.3%** |
-| Mean response payload | 2,795 bytes JSON | 1,726 bytes CHORUS |
-| **Payload reduction** | — | **38.3%** |
-| Top-5 Jaccard overlap (ranking) | — | 0.42 avg |
+### Embedding calls — structural, not tunable
 
-> Run `python benchmark/api/run_prismapi_benchmark.py` to reproduce. Raw JSON in `benchmark/api/results/`.
+| | Baseline (HTTP/REST) | PrismAPI (CHORUS) |
+|-|---------------------|-------------------|
+| Embedding calls — 15 queries | 90 | **15** |
+| Per query | 6.0 (1 query + 5 results) | **1.0 (query only)** |
+| **Saved** | — | **83.3%** |
 
-**On latency in loopback mode:** in-process, PrismAPI adds frame serialization/deserialization overhead (~48 ms vs ~20 ms baseline). In production, this reverses: each embedding API call (OpenAI, Gemini, Vertex) costs 20–100 ms and $0.00002/call. At 1,000 queries/second with top_k=10, the baseline pays **10,000 embedding API calls/second**; PrismAPI pays 1,000.
+This saving is structural: baseline pays `1 + top_k` embeds per query; PrismAPI always pays 1.  
+At top_k=10 and 1,000 queries/second: **10,000 embedding API calls/second eliminated**.
 
-The embedding call savings are **structural**, not implementation-dependent:
-- Baseline: 1 query embed + `top_k` result embeds = `1 + top_k` calls per query.
-- PrismAPI: 1 query embed only = **1 call per query**, regardless of `top_k`.
+### Retrieval quality vs. target_dim
 
-**On retrieval overlap (0.42 Jaccard):** the JL projection from 384-d to 64-d changes ranking order — the top-5 sets differ between the full-dim baseline and the projected PrismAPI path. Semantic neighborhoods are preserved (the same document cluster is retrieved) but exact rank ordering varies. This is the honest cost of the dimensionality reduction. Use a higher `target_dim` (128 or 256) to improve overlap at the cost of larger payloads.
+| target_dim | Payload vs JSON | Jaccard@5 | Recall@5 | **Recall@10** |
+|-----------|----------------|-----------|----------|--------------|
+| **64** | **−38%** (1,726 B) | 0.42 | 0.57 | **0.77** |
+| **128** | +7% (3,006 B) | 0.53 | 0.67 | **0.91** |
+
+**Recall@10** ("Recall at 2K") is the production metric: fetch `top_k × 2` from PrismAPI, re-rank with PrismResonance. At 128-dim, **91% of the relevant results are found** in the over-fetched set — at 83% fewer embedding calls.
+
+> Run `python benchmark/api/run_prismapi_benchmark.py --target-dim 64|128` to reproduce.  
+> Raw JSON in `benchmark/api/results/`.
+
+### Choosing target_dim
+
+- **64-dim**: 38% smaller payloads, 77% Recall@10. Best when bandwidth is the constraint.
+- **128-dim**: 91% Recall@10 at near-parity payload. Best when retrieval quality is the priority.
+
+### On loopback latency
+
+In these benchmarks, PrismAPI is slower per-query (~95 ms vs ~25 ms baseline) because loopback frame serialization is measured directly. **In production, this reverses:** each embedding API call (OpenAI, Gemini, Vertex) adds 20–100 ms and $0.00002. The baseline's `top_k` extra embedding calls per query dominate end-to-end latency at any meaningful scale.
 
 ---
 

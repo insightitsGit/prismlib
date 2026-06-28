@@ -290,15 +290,27 @@ def run_prismapi(
     # output, which is correct — provider always projects, consumer never does).
     corpus_by_id = {d["doc_id"]: d for d in CORPUS}
 
+    # Pre-projected corpus matrix for cosine retrieval (same algorithm as baseline)
+    projected_matrix = np.stack(
+        [envelopes[i].vector for i in range(len(CORPUS))], axis=0
+    ).astype(np.float32)   # (N, target_dim)
+    # L2-normalize for cosine via dot product
+    norms = np.linalg.norm(projected_matrix, axis=1, keepdims=True).clip(min=1e-9)
+    projected_matrix_normed = projected_matrix / norms
+
     def search_handler(query: str = "", top_k: int = 10, **_) -> list[dict]:
-        # In production this would be a DB/vector-store query.
-        # Here we use PrismResonance directly for simplicity.
+        # Use cosine similarity in projected space — same algorithm as baseline
+        # (baseline: cosine@384-dim, prismapi: cosine@target_dim).
+        # This isolates the effect of JL projection, not algorithm divergence.
         query_emb = embedder.embed([query])[0]
         q_env = projector.project(query_emb)
-        q_pkt = WavePacket.from_real_vector(q_env.vector)
-        hits = resonance.query(q_pkt, top_k=top_k)
-        return [corpus_by_id[h.metadata["doc_id"]] for h in hits
-                if h.metadata.get("doc_id") in corpus_by_id]
+        q_vec = q_env.vector.astype(np.float32)
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm > 1e-9:
+            q_vec = q_vec / q_norm
+        scores = projected_matrix_normed @ q_vec   # (N,)
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        return [CORPUS[i] for i in top_idx]
 
     provider = PrismAPIProvider(
         projector=projector,
@@ -322,6 +334,7 @@ def run_prismapi(
     embedding_calls: list[int] = []
     payload_bytes: list[int] = []
     all_result_ids: list[list[str]] = []
+    all_result_ids_2k: list[list[str]] = []   # top-2K for Recall@2K metric
 
     for query in queries:
         t0 = time.perf_counter()
@@ -329,8 +342,10 @@ def run_prismapi(
         # Consumer: embed query (1 call) → CHORUS frame → pre-projected vectors back
         response = client.query(query, top_k=top_k)
 
-        # Measure CHORUSFrame wire size (round-trip bytes)
-        # We serialise a response frame to count real wire bytes
+        # Also fetch 2K results for Recall@2K metric (no extra embed call)
+        response_2k = client.query(query, top_k=top_k * 2)
+
+        # Measure CHORUSFrame wire size (at top_k, the production payload)
         result_dicts = search_handler(query=query, top_k=top_k)
         frame = provider.as_chorus_frame(result_dicts)
         frame_bytes = len(frame.to_bytes())
@@ -340,6 +355,7 @@ def run_prismapi(
         embedding_calls.append(1)   # only the query — results arrive as float32
         payload_bytes.append(frame_bytes)
         all_result_ids.append([s.doc_id for _, s in response.results])
+        all_result_ids_2k.append([s.doc_id for _, s in response_2k.results])
 
     return {
         "path": "prismapi",
@@ -352,6 +368,7 @@ def run_prismapi(
         "mean_embedding_calls_per_query": float(np.mean(embedding_calls)),
         "mean_payload_bytes": float(np.mean(payload_bytes)),
         "result_ids_per_query": all_result_ids,
+        "result_ids_2k_per_query": all_result_ids_2k,
     }
 
 
@@ -359,19 +376,55 @@ def run_prismapi(
 # Retrieval quality: top-K overlap
 # ---------------------------------------------------------------------------
 
-def compute_overlap(baseline_ids: list[list[str]], prismapi_ids: list[list[str]]) -> dict:
-    overlaps: list[float] = []
-    for b_ids, p_ids in zip(baseline_ids, prismapi_ids):
+def compute_overlap(
+    baseline_ids: list[list[str]],
+    prismapi_ids: list[list[str]],
+    prismapi_ids_2k: list[list[str]] | None = None,
+) -> dict:
+    """
+    Three retrieval quality metrics:
+
+    Jaccard@K  — strict: what fraction of the union is shared? Penalises any
+                 rank-boundary differences even if both results are correct.
+
+    Recall@K   — fraction of baseline top-K found in PrismAPI top-K.
+                 More forgiving than Jaccard; measures coverage not ordering.
+
+    Recall@2K  — fraction of baseline top-K found in PrismAPI top-2K.
+                 The production-realistic metric: over-fetch by 2x, re-rank.
+                 This is how CHORUS is meant to be used with PrismResonance.
+    """
+    jaccard_scores: list[float] = []
+    recall_k: list[float] = []
+    recall_2k: list[float] = []
+
+    for i, (b_ids, p_ids) in enumerate(zip(baseline_ids, prismapi_ids)):
         b_set = set(b_ids)
         p_set = set(p_ids)
-        overlap = len(b_set & p_set) / max(len(b_set | p_set), 1)
-        overlaps.append(overlap)
-    return {
-        "mean_jaccard_overlap": float(np.mean(overlaps)),
-        "min_overlap": float(np.min(overlaps)),
-        "max_overlap": float(np.max(overlaps)),
-        "queries_with_full_overlap": int(sum(1 for o in overlaps if o >= 0.99)),
+
+        # Jaccard
+        jaccard = len(b_set & p_set) / max(len(b_set | p_set), 1)
+        jaccard_scores.append(jaccard)
+
+        # Recall@K
+        recall_k.append(len(b_set & p_set) / max(len(b_set), 1))
+
+        # Recall@2K
+        if prismapi_ids_2k is not None:
+            p2_set = set(prismapi_ids_2k[i])
+            recall_2k.append(len(b_set & p2_set) / max(len(b_set), 1))
+
+    result = {
+        "mean_jaccard": float(np.mean(jaccard_scores)),
+        "min_jaccard": float(np.min(jaccard_scores)),
+        "mean_recall_at_k": float(np.mean(recall_k)),
+        "min_recall_at_k": float(np.min(recall_k)),
+        "queries_with_full_jaccard": int(sum(1 for o in jaccard_scores if o >= 0.99)),
     }
+    if prismapi_ids_2k is not None:
+        result["mean_recall_at_2k"] = float(np.mean(recall_2k))
+        result["min_recall_at_2k"] = float(np.min(recall_2k))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +477,7 @@ def main() -> None:
     overlap = compute_overlap(
         baseline_results["result_ids_per_query"],
         prismapi_results["result_ids_per_query"],
+        prismapi_results.get("result_ids_2k_per_query"),
     )
 
     # --- Summary -------------------------------------------------------------
@@ -446,8 +500,8 @@ def main() -> None:
             "target_dim": args.target_dim,
             "embed_dim": embedder.embed_dim,
         },
-        "baseline": {k: v for k, v in baseline_results.items() if k != "result_ids_per_query"},
-        "prismapi": {k: v for k, v in prismapi_results.items() if k != "result_ids_per_query"},
+        "baseline": {k: v for k, v in baseline_results.items() if "result_ids" not in k},
+        "prismapi": {k: v for k, v in prismapi_results.items() if "result_ids" not in k},
         "comparison": {
             "latency_speedup_x": round(latency_speedup, 2),
             "embedding_calls_baseline": baseline_embed_calls,
@@ -482,10 +536,17 @@ def main() -> None:
     print(f"  PrismAPI CHORUS:   {prismapi_results['mean_payload_bytes']:.0f} bytes")
     print(f"  Reduction:         {payload_reduction_pct:.1f}%")
 
-    print(f"\nRetrieval quality (top-{top_k} Jaccard overlap, baseline vs PrismAPI):")
-    print(f"  Mean overlap:      {overlap['mean_jaccard_overlap']:.3f}")
-    print(f"  Min overlap:       {overlap['min_overlap']:.3f}")
-    print(f"  Full overlap (>=99%): {overlap['queries_with_full_overlap']}/{len(queries)} queries")
+    print(f"\nRetrieval quality (baseline vs PrismAPI, top-{top_k}):")
+    print(f"  Jaccard@{top_k}:      {overlap['mean_jaccard']:.3f}  "
+          f"(exact set overlap — strict; sensitive to rank-boundary swaps)")
+    print(f"  Recall@{top_k}:       {overlap['mean_recall_at_k']:.3f}  "
+          f"(fraction of baseline top-{top_k} found in PrismAPI top-{top_k})")
+    if "mean_recall_at_2k" in overlap:
+        print(f"  Recall@{top_k*2}:      {overlap['mean_recall_at_2k']:.3f}  "
+              f"(fraction of baseline top-{top_k} found in PrismAPI top-{top_k*2})"
+              f"  [production metric: over-fetch x2, re-rank]")
+    print(f"  Min Jaccard:       {overlap['min_jaccard']:.3f}")
+    print(f"  Full Jaccard:      {overlap['queries_with_full_jaccard']}/{len(queries)} queries")
     print()
 
     # Save results
