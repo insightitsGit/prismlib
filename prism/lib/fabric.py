@@ -101,13 +101,15 @@ class FrameType(Enum):
     HEALTH    — container vitals: CPU, RAM, disk, latency (JSON payload)
     APP_EVENT — app-level message: error, warning, info, custom (JSON)
     """
-    VECTOR    = 0x01
-    DELTA     = 0x02
-    SIGNAL    = 0x03
-    CONFIG    = 0x04
-    METRIC    = 0x05
-    HEALTH    = 0x06
-    APP_EVENT = 0x07
+    VECTOR       = 0x01
+    DELTA        = 0x02
+    SIGNAL       = 0x03
+    CONFIG       = 0x04
+    METRIC       = 0x05
+    HEALTH       = 0x06
+    APP_EVENT    = 0x07
+    API_REQUEST  = 0x08   # Consumer → Provider: query vector + JSON context
+    API_RESPONSE = 0x09   # Provider → Consumer: result vectors + exact sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +679,75 @@ class CHORUSFrame:
         return cls(key_id, seq, watermark, FrameType.METRIC,
                    json.dumps(metric.to_dict()).encode())
 
+    @classmethod
+    def from_api_request(
+        cls,
+        key_id: str,
+        seq: int,
+        watermark: bytes,
+        query_vector: np.ndarray,
+        context: Optional[dict] = None,
+    ) -> "CHORUSFrame":
+        """
+        API_REQUEST frame: query vector followed by a small JSON context blob.
+
+        Wire layout inside payload:
+            [dim:        4 bytes uint32       ]
+            [vec_bytes:  dim * 4 bytes float32]
+            [ctx_len:    4 bytes uint32       ]
+            [ctx_json:   ctx_len bytes UTF-8  ]
+
+        context carries top_k, filters, and optional query text for providers
+        that need it (e.g. for hybrid search).  It is plain JSON — small.
+        """
+        v = np.atleast_1d(query_vector).astype(np.float32)
+        dim = v.shape[0]
+        ctx_bytes = json.dumps(context or {}).encode()
+        payload = (
+            struct.pack(">I", dim)
+            + v.tobytes()
+            + struct.pack(">I", len(ctx_bytes))
+            + ctx_bytes
+        )
+        return cls(key_id, seq, watermark, FrameType.API_REQUEST, payload)
+
+    @classmethod
+    def from_api_response(
+        cls,
+        key_id: str,
+        seq: int,
+        watermark: bytes,
+        results: list[tuple[np.ndarray, dict]],
+    ) -> "CHORUSFrame":
+        """
+        API_RESPONSE frame: a sequence of (vector, sidecar_dict) pairs.
+
+        Wire layout inside payload:
+            [n_results:  4 bytes uint32                    ]
+            [dim:        4 bytes uint32                    ]
+            for each result:
+                [vec_bytes:  dim * 4 bytes float32         ]
+                [side_len:   4 bytes uint32                ]
+                [side_json:  side_len bytes UTF-8          ]
+
+        Vectors carry semantic content.  Sidecar carries exact fields (IDs,
+        prices, counts) that are lossy in vector space and must not be
+        embedded.  The consumer receives both in a single frame — no second
+        HTTP round-trip for metadata.
+        """
+        if not results:
+            payload = struct.pack(">II", 0, 0)
+            return cls(key_id, seq, watermark, FrameType.API_RESPONSE, payload)
+
+        dim = results[0][0].shape[0]
+        parts = [struct.pack(">II", len(results), dim)]
+        for vec, sidecar in results:
+            v = np.atleast_1d(vec).astype(np.float32)
+            side_bytes = json.dumps(sidecar).encode()
+            parts.append(v.tobytes())
+            parts.append(struct.pack(">I", len(side_bytes)) + side_bytes)
+        return cls(key_id, seq, watermark, FrameType.API_RESPONSE, b"".join(parts))
+
     # ------------------------------------------------------------------
     # Decode helpers
     # ------------------------------------------------------------------
@@ -701,6 +772,31 @@ class CHORUSFrame:
 
     def decode_metric(self) -> "MetricPayload":
         return MetricPayload.from_dict(json.loads(self.payload))
+
+    def decode_api_request(self) -> tuple[np.ndarray, dict]:
+        """Decode an API_REQUEST frame → (query_vector, context_dict)."""
+        offset = 0
+        dim = struct.unpack_from(">I", self.payload, offset)[0]; offset += 4
+        vec = np.frombuffer(
+            self.payload[offset : offset + dim * 4], dtype=np.float32
+        ).copy(); offset += dim * 4
+        ctx_len = struct.unpack_from(">I", self.payload, offset)[0]; offset += 4
+        ctx = json.loads(self.payload[offset : offset + ctx_len]) if ctx_len else {}
+        return vec, ctx
+
+    def decode_api_response(self) -> list[tuple[np.ndarray, dict]]:
+        """Decode an API_RESPONSE frame → list of (vector, sidecar_dict)."""
+        offset = 0
+        n, dim = struct.unpack_from(">II", self.payload, offset); offset += 8
+        results: list[tuple[np.ndarray, dict]] = []
+        for _ in range(n):
+            vec = np.frombuffer(
+                self.payload[offset : offset + dim * 4], dtype=np.float32
+            ).copy(); offset += dim * 4
+            side_len = struct.unpack_from(">I", self.payload, offset)[0]; offset += 4
+            sidecar = json.loads(self.payload[offset : offset + side_len]); offset += side_len
+            results.append((vec, sidecar))
+        return results
 
 
 # Keep VectorFrame as a backward-compatible alias
