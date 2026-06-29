@@ -41,9 +41,11 @@ PrismAPIClient works in two modes:
 
 from __future__ import annotations
 
+import http.client
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -60,6 +62,44 @@ from prism.api.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Retry configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetryConfig:
+    """
+    Controls retry behaviour for the production HTTP client.
+
+    Attributes
+    ----------
+    max_retries:
+        Maximum number of retry attempts after the initial failure (0 = no retry).
+    backoff_base:
+        Base sleep duration in seconds.  Sleep doubles each retry:
+        backoff_base, 2×, 4× ...  Capped at backoff_max.
+    backoff_max:
+        Maximum sleep between retries.
+    timeout_connect:
+        TCP connect timeout in seconds.
+    timeout_read:
+        Socket read timeout in seconds.
+    """
+
+    max_retries: int = 3
+    backoff_base: float = 0.5
+    backoff_max: float = 8.0
+    timeout_connect: float = 5.0
+    timeout_read: float = 30.0
+
+    @property
+    def timeout(self) -> float:
+        """Total socket timeout (connect + read)."""
+        return self.timeout_connect + self.timeout_read
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -113,6 +153,8 @@ class PrismAPIClient:
         host: str = "localhost",
         port: int = 9100,
         source_field: str = "body",
+        retry: Optional[RetryConfig] = None,
+        chorus_path: str = "/chorus/search",
     ) -> None:
         self._projector = projector
         self._embedder = embedder
@@ -120,12 +162,65 @@ class PrismAPIClient:
         self._host = host
         self._port = port
         self._source_field = source_field
+        self._retry = retry or RetryConfig()
+        self._chorus_path = chorus_path
+
+        # Persistent HTTP connection (keep-alive, reused across requests)
+        self._conn: Optional[http.client.HTTPConnection] = None
 
         # Cipher for signing outbound request frames
         dim = projector._cfg.target_dim
         self._cipher = TensorCipher(dim=dim, ttl_seconds=3600.0)
         self._cipher.rotate_key()
         self._seq = 0
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _get_conn(self) -> http.client.HTTPConnection:
+        """Return a live persistent connection, creating one if needed."""
+        if self._conn is None:
+            self._conn = http.client.HTTPConnection(
+                self._host,
+                self._port,
+                timeout=self._retry.timeout,
+            )
+        return self._conn
+
+    def _close_conn(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self) -> None:
+        """Close the persistent HTTP connection."""
+        self._close_conn()
+
+    def __enter__(self) -> "PrismAPIClient":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def health_check(self) -> bool:
+        """
+        Ping the server's /health endpoint.
+
+        Returns True if the server responds 200 OK, False otherwise.
+        """
+        try:
+            conn = self._get_conn()
+            conn.request("GET", "/health")
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status == 200
+        except Exception:
+            self._close_conn()
+            return False
 
     # ------------------------------------------------------------------
     # Main query interface
@@ -267,32 +362,65 @@ class PrismAPIClient:
         return CHORUSFrame.from_bytes(resp_frame.to_bytes())
 
     def _http_exchange(self, req_frame: CHORUSFrame) -> CHORUSFrame:
-        """Networked exchange over HTTP with application/x-chorus-frame body."""
-        try:
-            import urllib.request as _req
-        except ImportError as exc:
-            raise TransportError("urllib not available") from exc
+        """
+        Networked exchange over HTTP with retry and persistent connection.
 
-        url = f"http://{self._host}:{self._port}/chorus/query"
+        Uses http.client.HTTPConnection with keep-alive for connection reuse.
+        Retries on transient errors (ConnectionError, timeout) with exponential
+        backoff.  Re-establishes connection after any transport failure.
+        """
         data = req_frame.to_bytes()
-        http_req = _req.Request(
-            url,
-            data=data,
-            headers={"Content-Type": "application/x-chorus-frame"},
-            method="POST",
-        )
-        try:
-            with _req.urlopen(http_req, timeout=30) as resp:
-                body = resp.read()
-        except Exception as exc:
-            raise TransportError(f"HTTP exchange failed: {exc}") from exc
+        headers = {
+            "Content-Type": "application/x-chorus-frame",
+            "Content-Length": str(len(data)),
+            "Connection": "keep-alive",
+        }
 
-        frame = CHORUSFrame.from_bytes(body)
-        if frame.frame_type != FrameType.API_RESPONSE:
-            raise FrameTypeError(
-                f"Expected API_RESPONSE, got {frame.frame_type.name}"
-            )
-        return frame
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._retry.max_retries + 1):
+            if attempt > 0:
+                sleep_s = min(
+                    self._retry.backoff_base * (2 ** (attempt - 1)),
+                    self._retry.backoff_max,
+                )
+                logger.warning(
+                    "PrismAPIClient: retry %d/%d after %.1fs (error: %s)",
+                    attempt,
+                    self._retry.max_retries,
+                    sleep_s,
+                    last_exc,
+                )
+                time.sleep(sleep_s)
+
+            try:
+                conn = self._get_conn()
+                conn.request("POST", self._chorus_path, body=data, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+
+                if resp.status != 200:
+                    raise TransportError(
+                        f"Server returned HTTP {resp.status}: {body[:200]}"
+                    )
+
+                frame = CHORUSFrame.from_bytes(body)
+                if frame.frame_type != FrameType.API_RESPONSE:
+                    raise FrameTypeError(
+                        f"Expected API_RESPONSE, got {frame.frame_type.name}"
+                    )
+                return frame
+
+            except (FrameTypeError, TransportError):
+                # Non-retryable protocol errors — surface immediately
+                raise
+            except Exception as exc:
+                last_exc = exc
+                # Connection-level error — drop and reconnect on next attempt
+                self._close_conn()
+
+        raise TransportError(
+            f"HTTP exchange failed after {self._retry.max_retries + 1} attempts: {last_exc}"
+        ) from last_exc
 
 
 # ---------------------------------------------------------------------------
