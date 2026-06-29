@@ -30,6 +30,9 @@ import sys
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from functools import lru_cache
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +99,62 @@ def _pack_chorus_response(indices: list[int]) -> bytes:
     return frame.to_bytes()
 
 
+def _cosine_search_projected_vec(query_vec: np.ndarray, top_k: int) -> list[int]:
+    """
+    Search in projected space using a pre-projected query vector directly.
+    No embedding call — the client already projected and sent the vector.
+    This is the key optimisation: when the client sends a float32 vector
+    in the CHORUSFrame, the server uses it as-is. Zero server embed calls.
+    """
+    q = query_vec.astype(np.float32)
+    norm = np.linalg.norm(q)
+    if norm > 1e-9:
+        q = q / norm
+    scores = _corpus_projected @ q
+    return list(np.argsort(scores)[::-1][:top_k])
+
+
+# Thread-safe LRU cache for baseline query embeddings.
+# In concurrent load, many agents send identical or near-identical queries.
+# Caching avoids redundant embedding calls under load.
+_embed_cache: dict[str, np.ndarray] = {}
+_embed_cache_lock = threading.Lock()
+_EMBED_CACHE_MAX = 512
+
+
+def _embed_query_cached(query: str) -> np.ndarray:
+    """Return cached embedding or compute and cache it (thread-safe)."""
+    with _embed_cache_lock:
+        if query in _embed_cache:
+            return _embed_cache[query]
+    # Compute outside the lock — embedding is slow, don't block other threads
+    emb = _embedder.embed([query])[0]
+    with _embed_cache_lock:
+        if len(_embed_cache) >= _EMBED_CACHE_MAX:
+            # Evict oldest entry (FIFO approximation)
+            oldest = next(iter(_embed_cache))
+            del _embed_cache[oldest]
+        _embed_cache[query] = emb
+    return emb
+
+
+# ---------------------------------------------------------------------------
+# Threaded HTTP server — handles concurrent requests in separate threads
+# ---------------------------------------------------------------------------
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """
+    Spawns a thread per request.
+
+    Why: http.server.HTTPServer is single-threaded — under concurrent load
+    requests queue up and wait for the previous one to finish. ThreadingMixIn
+    dispatches each connection to a new thread immediately. The GIL means
+    CPU-bound numpy ops still contend, but I/O waits (embedding model load,
+    socket reads) are released, so real concurrency is achieved.
+    """
+    daemon_threads = True   # threads exit when main process exits
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -150,7 +209,7 @@ class BenchHandler(BaseHTTPRequestHandler):
             return
 
         t_embed_start = time.perf_counter()
-        query_emb = _embedder.embed([query])[0]
+        query_emb = _embed_query_cached(query)
         t_embed_ms = (time.perf_counter() - t_embed_start) * 1000.0
 
         indices = _cosine_search_fullrank(query_emb, top_k)
@@ -194,14 +253,16 @@ class BenchHandler(BaseHTTPRequestHandler):
                 return
 
             query_vec, ctx = req_frame.decode_api_request()
-            query_text = ctx.get("query_text", "")
             top_k = int(ctx.get("top_k", 5))
+            t_embed_ms = 0.0   # server does NO embedding on the CHORUS path
 
-            # Embed query (1 call) — the ONLY embed call in the PrismAPI path
-            query_emb = _embedder.embed([query_text])[0] if query_text else None
-            t_embed_ms = (time.perf_counter() - t_embed_start) * 1000.0
-
-            indices = _cosine_search_projected(query_emb, top_k) if query_emb is not None else list(range(top_k))
+            # KEY: use the client's pre-projected query vector directly.
+            # The client embedded its query and projected it to target_dim before
+            # sending. The server searches in the same projected space with zero
+            # embedding calls. This is the data-type separation: CHORUS frames
+            # carry float32 vectors, not text — the server never touches the
+            # embedding model for this path.
+            indices = _cosine_search_projected_vec(query_vec, top_k)
 
             # Pack pre-projected vectors from the index — NO re-embedding
             resp_bytes = _pack_chorus_response(indices)
@@ -291,8 +352,8 @@ def main() -> None:
 
     build_index(_embedder, _projector)
 
-    server = HTTPServer(("127.0.0.1", args.port), BenchHandler)
-    print(f"[server] Listening on 127.0.0.1:{args.port} (target_dim={args.dim})", flush=True)
+    server = ThreadedHTTPServer(("127.0.0.1", args.port), BenchHandler)
+    print(f"[server] Listening on 127.0.0.1:{args.port} (target_dim={args.dim}, threaded)", flush=True)
     print("[server] READY", flush=True)
     server.serve_forever()
 

@@ -609,7 +609,7 @@ def main() -> None:
         print(f"\n[runner] Loading client embedder...")
         embedder = SentenceTransformerEmbedder(model_name=args.model)
         projector = PrismProjector(ProjectionConfig(
-            tenant_id="bench-client",
+            tenant_id="bench-tenant",   # must match server — same projection matrix
             target_dim=args.dim,
         ))
 

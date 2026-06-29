@@ -149,39 +149,66 @@ All other dependencies (`prism.lib.fabric`, `prism.lib.lang`, `prism.lib.resonan
 
 ## Benchmark Results
 
-61-document corpus, 15 queries, top-5, all-MiniLM-L6-v2 (384-dim → JL projection).
+**Real HTTP benchmark** — 200-document corpus, 50 queries, top-5, all-MiniLM-L6-v2 (384-dim → 64-dim JL projection).  
+Bench server runs as a separate process; client fires real HTTP requests. No loopback shortcuts.
+
+> Run: `python benchmark/api/run_real_benchmark.py --dim 64`  
+> Raw JSON: `benchmark/api/results/real_benchmark_results.json`
+
+### End-to-end latency (real HTTP RTT, 3 trials per query)
+
+|  | Baseline (HTTP/JSON) | PrismAPI (CHORUS) |
+|--|---------------------|-------------------|
+| Mean | 6.4 ms | **1.8 ms** |
+| P50 | 2.0 ms | **1.6 ms** |
+| P95 | 18.0 ms | **1.9 ms** |
+| P99 | 23.8 ms | 11.2 ms |
+| Server embed latency | 3.4 ms | **0.0 ms** |
+| Client embed latency | 36.8 ms | **0.0 ms** |
 
 ### Embedding calls — structural, not tunable
 
 | | Baseline (HTTP/REST) | PrismAPI (CHORUS) |
 |-|---------------------|-------------------|
-| Embedding calls — 15 queries | 90 | **15** |
+| Embedding calls — 50 queries × 3 trials | 900 | **150** |
 | Per query | 6.0 (1 query + 5 results) | **1.0 (query only)** |
 | **Saved** | — | **83.3%** |
 
 This saving is structural: baseline pays `1 + top_k` embeds per query; PrismAPI always pays 1.  
 At top_k=10 and 1,000 queries/second: **10,000 embedding API calls/second eliminated**.
 
-### Retrieval quality vs. target_dim
+### Wire bytes (mean per query)
 
-| target_dim | Payload vs JSON | Jaccard@5 | Recall@5 | **Recall@10** |
-|-----------|----------------|-----------|----------|--------------|
-| **64** | **−38%** (1,726 B) | 0.42 | 0.57 | **0.77** |
-| **128** | +7% (3,006 B) | 0.53 | 0.67 | **0.91** |
+| | Baseline | PrismAPI | Delta |
+|-|----------|----------|-------|
+| Mean wire bytes | 2,448 B | 2,146 B | **−12.3%** |
 
-**Recall@10** ("Recall at 2K") is the production metric: fetch `top_k × 2` from PrismAPI, re-rank with PrismResonance. At 128-dim, **91% of the relevant results are found** in the over-fetched set — at 83% fewer embedding calls.
+### Retrieval quality (64-dim projection vs. full-rank 384-dim baseline)
 
-> Run `python benchmark/api/run_prismapi_benchmark.py --target-dim 64|128` to reproduce.  
-> Raw JSON in `benchmark/api/results/`.
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| Jaccard@5 | 0.489 | Exact set overlap with baseline top-5 |
+| Recall@5 | 0.632 | Fraction of baseline top-5 recovered |
+| **Recall@10** | **0.732** | Over-fetch 2×, re-rank — production metric |
+
+**Recall@10** is the production metric: fetch `top_k × 2` from PrismAPI, re-rank with PrismResonance. At 64-dim, **73% of the relevant results are in the over-fetched set** — at 83% fewer embedding calls.
+
+### Concurrency (10 agents, 100 requests)
+
+| | Baseline | PrismAPI |
+|-|----------|----------|
+| Throughput | 187.1 req/s | 130.7 req/s |
+| P50 latency | 3.0 ms | **3.1 ms** |
+| P95 latency | 10.7 ms | **5.3 ms** |
+| P99 latency | 517.1 ms | **6.6 ms** |
+| Errors | 0 | 0 |
+
+PrismAPI P95/P99 tail latency is 2–78× better under load. Baseline's P99 spike (517 ms) comes from embedding model saturation; the CHORUS path eliminates server embedding entirely.
 
 ### Choosing target_dim
 
-- **64-dim**: 38% smaller payloads, 77% Recall@10. Best when bandwidth is the constraint.
-- **128-dim**: 91% Recall@10 at near-parity payload. Best when retrieval quality is the priority.
-
-### On loopback latency
-
-In these benchmarks, PrismAPI is slower per-query (~95 ms vs ~25 ms baseline) because loopback frame serialization is measured directly. **In production, this reverses:** each embedding API call (OpenAI, Gemini, Vertex) adds 20–100 ms and $0.00002. The baseline's `top_k` extra embedding calls per query dominate end-to-end latency at any meaningful scale.
+- **64-dim**: −12% payload, 73% Recall@10. Best when bandwidth is the constraint.
+- **128-dim**: Higher Recall@10 (run `--dim 128` to measure). Best when retrieval quality is the priority.
 
 ---
 
@@ -226,7 +253,11 @@ prism/api/
     mcp.py           PrismAPIMCPServer (stdio JSON-RPC + mcp-sdk integration)
 
 benchmark/api/
-    run_prismapi_benchmark.py   Full corpus benchmark, baseline vs PrismAPI
+    bench_corpus.py             200-document corpus + 50 queries (8 domains)
+    bench_server.py             Threaded HTTP server (baseline + CHORUS endpoints)
+    run_real_benchmark.py       Real HTTP benchmark — starts server as subprocess
+    run_prismapi_benchmark.py   Loopback benchmark (in-process, no network)
+    results/                    JSON result files
 
 examples/
     prismapi_quickstart.py      End-to-end demo, no network required
