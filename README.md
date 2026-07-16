@@ -7,6 +7,42 @@
 
 **Tensor-native LLM cache, distributed DB driver, and cluster intelligence — one package.**
 
+**AI assistants:** [docs/ai-overview.md](docs/ai-overview.md) · [docs/llm-context.md](docs/llm-context.md) · [docs/architecture.md](docs/architecture.md)
+
+## What is this?
+
+`prismlib` 0.4.0 (`import prism`) is an in-process intelligence stack: semantic LLM cache, WAL-streamed DB driver, and optional cluster mesh. No mandatory Redis / Pinecone / Prometheus / Kubernetes operator.
+
+## Who is it for?
+
+Engineers cutting LLM repeat cost, DB read latency, or multi-container duplicate work — beside the app process.
+
+## What problem does it solve?
+
+Repeated LLM calls, network-bound DB reads, and cluster-wide duplicated answers.
+
+## Replace / complement / integrate
+
+| Relationship | Technology | Meaning |
+|--------------|------------|---------|
+| **Alternative to** | Redis + custom semantic cache | In-process PrismCache |
+| **Complements** | Vector DBs, agent runtimes | Cache/driver beside them |
+| **Integrates with** | CHORUS Fabric, PrismResonance | Transport / local index |
+| **Extended by** | ChorusMesh, prismlib-plus | Paid alerts / fuller Plus stack |
+
+## When NOT to use it
+
+- You only want a managed cloud cache and will not run in-process code.  
+- You need Slack/PagerDuty/Kafka enterprise orchestration → ChorusMesh.  
+- Treat README % figures as workload-specific, not universal guarantees.
+
+```bash
+pip install "prismlib[cache]"
+# or: pip install "prismlib[fabric]"
+```
+
+---
+
 PrismLib has three layers. Use any combination:
 
 | Layer | What it solves | Key number | Install |
@@ -465,18 +501,21 @@ capabilities on top of the single-node stack — no extra install, no extra infr
 | **Blue/Green/Orange failover** | Three-tier hot-standby: GREEN (active), BLUE (warm standby, auto-promotes in ~3s), ORANGE (syncing reserve). No Raft dependency. No K8s operator. |
 | **ContextCompressor** | Ranks RAG context chunks by cosine similarity, keeps top-K. Saves 58–64% of context tokens before every LLM call. In-process, no extra model. |
 
-### Cluster benchmark results (3-node, live run)
+### Cluster benchmark results (3-node, Azure Container Apps · 2 VNets · westus2)
 
 | Metric | Result |
 |--------|--------|
 | Token savings — cluster avg | **76.1%** |
 | BLUE node (cluster cache hit) | **100%** — 0 LLM calls |
-| ORANGE node (cross-network cache hit) | **100%** — 0 LLM calls |
+| ORANGE node (cross-VNet cache hit) | **100%** — 0 LLM calls |
 | Context compression | **58–64%** per query |
-| Health alert propagation | **<1 s** (709–711 ms measured) |
-| Failover — BLUE promoted to GREEN | **~3–4 s**, no human step |
+| CHORUS frame latency (cross-VNet) | **~22 ms** (same-region) |
+| Health alert propagation | **633–674 ms** measured |
+| Failover — BLUE promoted to GREEN | **~4 s** detect + **97 ms** promote |
 
-See [`benchmark/cluster/`](benchmark/cluster/) for the full benchmark code and [`benchmark/cluster/cluster_benchmark_results.json`](benchmark/cluster/cluster_benchmark_results.json) for raw results.
+See [`benchmark/cluster/`](benchmark/cluster/) for the benchmark code, [`deploy/azure_cluster_run.sh`](deploy/azure_cluster_run.sh) for the Azure deploy, and [`benchmark/cluster/cluster_benchmark_results_azure.json`](benchmark/cluster/cluster_benchmark_results_azure.json) for raw results.
+
+**Full results in one place:** [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) — every cache, driver, and cluster number with sources. **The design & novelty:** [`whitepaper_chorus_mesh.md`](whitepaper_chorus_mesh.md) (cache-replication traffic doubling as the failure detector).
 
 ### ClusterCache — 5-line RAG integration
 
