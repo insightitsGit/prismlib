@@ -52,7 +52,22 @@ jobs:
       - name: Install benchmark deps
         run: pip install -e ".[dev]" && pip install -r benchmark/requirements.txt
 
+      - name: Start benchmark app (background)
+        run: |
+          python -m uvicorn benchmark.app.main:app --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health >/dev/null; then
+              echo "App healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App failed to become healthy"
+          exit 1
+        env:
+          PRISM_BENCHMARK_SMOKE: "1"
+
       - name: Run smoke benchmark (no Azure, in-memory only)
-        run: python benchmark/load/run_benchmark.py --scenario smoke --duration 30 --no-azure
+        run: python benchmark/load/run_benchmark.py --scenario smoke --duration 30 --no-azure --host http://127.0.0.1:8000
         env:
           PRISM_BENCHMARK_SMOKE: "1"

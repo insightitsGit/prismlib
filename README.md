@@ -1,6 +1,6 @@
 # PrismLib
 
-[![PyPI version](https://img.shields.io/badge/pypi-v0.4.0-blue.svg)](https://pypi.org/project/prismlib/)
+[![PyPI version](https://img.shields.io/badge/pypi-v0.5.0-blue.svg)](https://pypi.org/project/prismlib/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/prismlib/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![GitHub](https://img.shields.io/badge/github-insightitsGit%2Fprismlib-black?logo=github)](https://github.com/insightitsGit/prismlib)
@@ -11,7 +11,7 @@
 
 ## What is this?
 
-`prismlib` 0.4.0 (`import prism`) is an in-process intelligence stack: semantic LLM cache, WAL-streamed DB driver, and optional cluster mesh. No mandatory Redis / Pinecone / Prometheus / Kubernetes operator.
+`prismlib` 0.5.0 (`import prism`) is an in-process intelligence stack: semantic LLM cache, WAL-streamed DB driver, and optional cluster mesh. No mandatory Redis / Pinecone / Prometheus / Kubernetes operator.
 
 ## Who is it for?
 
@@ -218,12 +218,51 @@ from prism.cache import PrismCache
 cache = PrismCache.build(tenant_id="finance", llm_model="gpt-4o")
 
 # After processing queries...
-metrics = cache.metrics()
+metrics = cache.get_metrics()
 print(f"Hit rate:          {metrics.hit_rate:.0%}")
 print(f"Tokens saved:      {metrics.tokens_saved:,}")
 print(f"Cost saved today:  ${metrics.cost_saved_usd:.2f}")
 print(f"Projected monthly: ${metrics.cost_saved_usd * 30:.0f}")
 ```
+
+#### Selective invalidation, tags, and hit metadata (0.5.0)
+
+When a fact changes (e.g. a user correction), evict only related entries instead of calling `invalidate_all()`. Tags and projected query vectors survive SQLite persistence (`persist_path`).
+
+```python
+from prism.cache import PrismCache, HitMeta, HashEmbedder
+from prism.lib.lang import PrismProjector, ProjectionConfig
+import numpy as np
+
+hits: list[HitMeta] = []
+
+cache = PrismCache.build(
+    tenant_id="my-app",
+    llm_model="gpt-4o",
+    embedder=HashEmbedder(),
+    on_hit=hits.append,  # concurrent-safe; prefer over last_hit_meta under load
+)
+
+answer = cache.get_or_call(
+    query="Who is Person A?",
+    call_fn=lambda: "Person A is my brother",
+    tags=["person_a", "family"],
+)
+
+# Same-thread read-after-call (thread-local)
+meta = cache.last_hit_meta  # None on miss; HitMeta on hit
+
+# Evict by subject tag (ANY match)
+cache.invalidate_tags(["person_a"])
+
+# Evict by cosine similarity in tenant-projected space
+projector = PrismProjector(ProjectionConfig(tenant_id="my-app", target_dim=64))
+raw = HashEmbedder().embed("Person A is my sister")  # corrected fact text
+probe = projector.project(raw).vector
+cache.invalidate_where(probe, threshold=0.55)
+```
+
+**Note:** Selective invalidation is node-local. `ClusterCache` cluster entries are not cleared by these APIs — broadcast or TTL still apply at the cluster layer.
 
 ---
 
@@ -620,7 +659,7 @@ pip install "prismlib[all]"             # Everything
 **To publish a new version:**
 
 ```bash
-# 1. Bump version in pyproject.toml (currently 0.4.0)
+# 1. Bump version in pyproject.toml (currently 0.5.0)
 # 2. Build the distribution
 pip install build twine
 python -m build

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prismlib"
-version = "0.4.0"
+version = "0.5.0"
 description = "Tensor-native semantic cache and distributed data plane — PrismLib"
 authors = [{ name = "InsightIts", email = "insightits.info@gmail.com" }]
 requires-python = ">=3.11"
