@@ -14,7 +14,8 @@ Two backends ship out of the box:
                       File is created automatically on first use.
 
 The store holds the raw LLM response object (dict, string, or any
-JSON-serialisable value) alongside its TTL expiry timestamp.
+JSON-serialisable value) alongside its TTL expiry timestamp, optional
+subject tags, and the projected query vector used for selective eviction.
 Wave-packet IDs (UUIDs from PrismResonance) are the keys.
 
 Thread safety: both implementations use a threading.RLock internally.
@@ -29,7 +30,9 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,8 @@ class CacheEntry:
     hit_count:      Number of times this entry has been served from cache.
     tokens_saved:   Estimated tokens saved by cache hits (populated by caller).
     model:          LLM model name that produced this response.
+    tags:           Optional subject/entity tags for selective invalidation.
+    query_vector:   Tenant-projected query vector (float32) for vector eviction.
     """
 
     packet_id: str
@@ -73,12 +78,14 @@ class CacheEntry:
     hit_count: int = 0
     tokens_saved: int = 0
     model: str = ""
+    tags: list[str] = field(default_factory=list)
+    query_vector: Optional[np.ndarray] = None
 
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
 
     def to_dict(self) -> dict:
-        return {
+        d: dict[str, Any] = {
             "packet_id": self.packet_id,
             "query_text": self.query_text,
             "response": self.response,
@@ -87,10 +94,18 @@ class CacheEntry:
             "hit_count": self.hit_count,
             "tokens_saved": self.tokens_saved,
             "model": self.model,
+            "tags": list(self.tags),
         }
+        if self.query_vector is not None:
+            d["query_vector"] = self.query_vector.astype(np.float32).tolist()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "CacheEntry":
+        qv = d.get("query_vector")
+        query_vector: Optional[np.ndarray] = None
+        if qv is not None:
+            query_vector = np.asarray(qv, dtype=np.float32).ravel()
         return cls(
             packet_id=d["packet_id"],
             query_text=d["query_text"],
@@ -100,7 +115,21 @@ class CacheEntry:
             hit_count=d.get("hit_count", 0),
             tokens_saved=d.get("tokens_saved", 0),
             model=d.get("model", ""),
+            tags=list(d.get("tags") or []),
+            query_vector=query_vector,
         )
+
+
+def _encode_query_vector(vector: Optional[np.ndarray]) -> Optional[bytes]:
+    if vector is None:
+        return None
+    return np.asarray(vector, dtype=np.float32).ravel().tobytes()
+
+
+def _decode_query_vector(blob: Optional[bytes]) -> Optional[np.ndarray]:
+    if not blob:
+        return None
+    return np.frombuffer(blob, dtype=np.float32).copy()
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +172,15 @@ class CacheStore(abc.ABC):
     @abc.abstractmethod
     def total_tokens_saved(self) -> int:
         """Return the sum of tokens_saved across all entries."""
+
+    def iter_entries(self, *, include_expired: bool = False) -> Iterator[CacheEntry]:
+        """
+        Iterate entries for selective invalidation scans.
+
+        Default implementations may override for efficiency.
+        Does not increment hit_count.
+        """
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +244,13 @@ class InMemoryStore(CacheStore):
         with self._lock:
             return sum(e.tokens_saved for e in self._store.values())
 
+    def iter_entries(self, *, include_expired: bool = False) -> Iterator[CacheEntry]:
+        with self._lock:
+            snapshot = list(self._store.values())
+        for entry in snapshot:
+            if include_expired or not entry.is_expired():
+                yield entry
+
     def _evict_oldest(self) -> None:
         """Evict the 10% oldest entries when the store is full."""
         n_evict = max(1, self._max_size // 10)
@@ -231,7 +276,8 @@ class SQLiteStore(CacheStore):
 
     For multi-server deployments, each app node maintains its own
     SQLite file — the PrismResonance wave cache is the source of
-    truth for similarity lookups; SQLite is only for response storage.
+    truth for similarity lookups; SQLite holds responses plus tags
+    and projected query vectors for selective invalidation.
 
     Usage:
         store = SQLiteStore("/var/lib/prismcache/responses.db")
@@ -246,7 +292,9 @@ class SQLiteStore(CacheStore):
         expires_at   REAL NOT NULL,
         hit_count    INTEGER NOT NULL DEFAULT 0,
         tokens_saved INTEGER NOT NULL DEFAULT 0,
-        model        TEXT NOT NULL DEFAULT ''
+        model        TEXT NOT NULL DEFAULT '',
+        tags_json    TEXT NOT NULL DEFAULT '[]',
+        query_vector BLOB
     );
     CREATE INDEX IF NOT EXISTS idx_expires_at ON cache_entries (expires_at);
     """
@@ -266,23 +314,45 @@ class SQLiteStore(CacheStore):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(self._SCHEMA)
+        self._migrate(conn)
         conn.commit()
         return conn
 
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add 0.5.0 columns to pre-existing databases."""
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(cache_entries)").fetchall()
+        }
+        if "tags_json" not in cols:
+            conn.execute(
+                "ALTER TABLE cache_entries ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "query_vector" not in cols:
+            conn.execute(
+                "ALTER TABLE cache_entries ADD COLUMN query_vector BLOB"
+            )
+
     def save(self, entry: CacheEntry) -> None:
         response_json = json.dumps(entry.response, ensure_ascii=False)
+        tags_json = json.dumps(list(entry.tags), ensure_ascii=False)
+        query_blob = _encode_query_vector(entry.query_vector)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO cache_entries
                     (packet_id, query_text, response_json, created_at,
-                     expires_at, hit_count, tokens_saved, model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     expires_at, hit_count, tokens_saved, model,
+                     tags_json, query_vector)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(packet_id) DO UPDATE SET
                     response_json = excluded.response_json,
                     expires_at    = excluded.expires_at,
                     hit_count     = excluded.hit_count,
-                    tokens_saved  = excluded.tokens_saved
+                    tokens_saved  = excluded.tokens_saved,
+                    model         = excluded.model,
+                    tags_json     = excluded.tags_json,
+                    query_vector  = excluded.query_vector
                 """,
                 (
                     entry.packet_id,
@@ -293,6 +363,8 @@ class SQLiteStore(CacheStore):
                     entry.hit_count,
                     entry.tokens_saved,
                     entry.model,
+                    tags_json,
+                    query_blob,
                 ),
             )
             self._conn.commit()
@@ -324,16 +396,7 @@ class SQLiteStore(CacheStore):
             )
             self._conn.commit()
 
-        return CacheEntry(
-            packet_id=data["packet_id"],
-            query_text=data["query_text"],
-            response=json.loads(data["response_json"]),
-            created_at=data["created_at"],
-            expires_at=data["expires_at"],
-            hit_count=data["hit_count"] + 1,
-            tokens_saved=data["tokens_saved"],
-            model=data["model"],
-        )
+        return self._row_to_entry(data, hit_count=data["hit_count"] + 1)
 
     def delete(self, packet_id: str) -> None:
         with self._lock:
@@ -365,6 +428,40 @@ class SQLiteStore(CacheStore):
             cur = self._conn.execute("SELECT COALESCE(SUM(tokens_saved), 0) FROM cache_entries")
             return int(cur.fetchone()[0])
 
+    def iter_entries(self, *, include_expired: bool = False) -> Iterator[CacheEntry]:
+        with self._lock:
+            if include_expired:
+                cur = self._conn.execute("SELECT * FROM cache_entries")
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM cache_entries WHERE expires_at >= ?",
+                    (time.time(),),
+                )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        for data in rows:
+            yield self._row_to_entry(data, hit_count=data["hit_count"])
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    @staticmethod
+    def _row_to_entry(data: dict, *, hit_count: int) -> CacheEntry:
+        tags_raw = data.get("tags_json") or "[]"
+        try:
+            tags = list(json.loads(tags_raw))
+        except (TypeError, json.JSONDecodeError):
+            tags = []
+        return CacheEntry(
+            packet_id=data["packet_id"],
+            query_text=data["query_text"],
+            response=json.loads(data["response_json"]),
+            created_at=data["created_at"],
+            expires_at=data["expires_at"],
+            hit_count=hit_count,
+            tokens_saved=data["tokens_saved"],
+            model=data.get("model") or "",
+            tags=tags,
+            query_vector=_decode_query_vector(data.get("query_vector")),
+        )
