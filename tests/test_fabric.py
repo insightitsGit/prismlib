@@ -11,7 +11,9 @@ from prism.lib.fabric import (
     TensorCipher,
     FabricConfig,
     CHORUSFabric,
+    CHORUSFrame,
     VectorFrame,
+    FrameType,
     CipherError,
     WatermarkError,
     KeyExpiredError,
@@ -92,10 +94,11 @@ class TestTensorCipher:
 class TestVectorFrame:
     def test_roundtrip_serialisation(self) -> None:
         vectors = np.random.randn(4, DIM).astype(np.float32)
-        frame = VectorFrame(
+        watermark = b"\xde\xad" * 16
+        frame = CHORUSFrame.from_vectors(
             key_id="a" * 36,
             seq=42,
-            watermark=b"\xde\xad" * 16,
+            watermark=watermark,
             vectors=vectors,
         )
         data = frame.to_bytes()
@@ -103,7 +106,10 @@ class TestVectorFrame:
 
         assert recovered.seq == frame.seq
         assert recovered.watermark == frame.watermark
-        np.testing.assert_array_equal(recovered.vectors, frame.vectors)
+        assert recovered.frame_type == FrameType.VECTOR
+        np.testing.assert_array_equal(
+            recovered.decode_vectors(DIM), vectors
+        )
 
 
 # ---------------------------------------------------------------------------
